@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .data import bar_end
-from .signals import NO_DATA, level_hits, trend_series
+from .signals import NO_DATA, level_hits, rejects_level, trend_series
 
 MIN_SAMPLE = 20
 
@@ -288,6 +288,70 @@ def plan_history(
                      "godziny": held, "wynik [pkt]": round(float((exit_px - px) * sign - cost_pts), 2)})
         busy_until = exit_i
     return PlanHistory(len(starts), pd.DataFrame(rows, columns=cols), None if len(starts) else "Na historii H1 komplet warunków nie wystąpił ani razu.")
+
+
+def rejection_history(
+    frames: dict[str, pd.DataFrame], limit_h: float, cost_pts: float, now: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """H1 na ekstremach poprzedniej zamkniętej sesji D1, z wejściem na następnym otwarciu.
+
+    Każde dotknięcie oceniamy osobno. Odrzucenia są podzbiorem tej samej próby.
+    Oba warianty używają SL 1 ATR i TP 2 ATR, liczonych względem ceny wejścia.
+    """
+    now = pd.Timestamp.now(tz="UTC") if now is None else now
+    columns = ["sygnał", "kierunek", "poziom", "odrzucenie", "wejście", "cena wejścia", "wynik", "wynik [pkt]"]
+    h1, daily = frames["H1"], frames["D1"]
+    if len(h1) < 2 or daily.empty:
+        return pd.DataFrame(columns=columns)
+    h1 = h1[h1.index + pd.Timedelta(hours=1) <= now]
+    if len(h1) < 2:
+        return pd.DataFrame(columns=columns)
+
+    daily_end = pd.DatetimeIndex([bar_end("D1", day) for day in daily.index])
+    previous = daily_end.searchsorted(h1.index, side="right") - 1
+    opens, highs, lows, closes, atr = (h1[name].to_numpy() for name in ("open", "high", "low", "close", "atr"))
+    hours = _hours(h1)
+    duration = float(limit_h)
+    records = []
+    for direction, sign, side in (("long", 1, "low"), ("short", -1, "high")):
+        levels = np.where(previous >= 0, daily[side].to_numpy()[previous], np.nan)
+        touch = (lows <= levels) & (highs >= levels) & ((opens - levels) * sign > 0)
+        rejection = rejects_level(opens, highs, lows, closes, levels, direction)
+        for signal_i in np.flatnonzero(touch[:-1] & np.isfinite(atr[:-1]) & (atr[:-1] > 0)):
+            entry_i = signal_i + 1
+            entry = opens[entry_i]
+            sl = entry - sign * atr[signal_i]
+            tp = entry + sign * 2 * atr[signal_i]
+            deadline = hours[entry_i] + duration
+            outcome, exit_price = None, None
+            for j in range(entry_i, len(h1)):
+                if hours[j] + 1 > deadline:
+                    outcome, exit_price = "limit", closes[j - 1]
+                    break
+                if (opens[j] - sl) * sign <= 0:
+                    outcome, exit_price = "SL", opens[j]
+                    break
+                if (opens[j] - tp) * sign >= 0:
+                    outcome, exit_price = "TP", tp
+                    break
+                adverse, favorable = (lows[j], highs[j]) if sign > 0 else (highs[j], lows[j])
+                if (adverse - sl) * sign <= 0:
+                    outcome, exit_price = "SL", sl
+                    break
+                if (favorable - tp) * sign >= 0:
+                    outcome, exit_price = "TP", tp
+                    break
+            if outcome is None and hours[-1] + 1 >= deadline:
+                outcome, exit_price = "limit", closes[-1]
+            if exit_price is not None:
+                records.append({
+                    "sygnał": bar_end("H1", h1.index[signal_i]),
+                    "kierunek": direction.upper(), "poziom": levels[signal_i],
+                    "odrzucenie": bool(rejection[signal_i]),
+                    "wejście": h1.index[entry_i], "cena wejścia": entry, "wynik": outcome,
+                    "wynik [pkt]": (exit_price - entry) * sign - cost_pts,
+                })
+    return pd.DataFrame(records, columns=columns).sort_values(["sygnał", "kierunek"]).reset_index(drop=True)
 
 
 def summarize_holding(trades: pd.DataFrame) -> HoldingStats:

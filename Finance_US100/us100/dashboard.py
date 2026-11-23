@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from . import backtest, data, delivery, engine, indicators as ind, journal, notify, paper, plan, risk, signals, storage
+from . import backtest, data, delivery, engine, harmonics, indicators as ind, journal, notify, paper, plan, risk, signals, storage
 from .instruments import Instrument
 
 
@@ -33,7 +33,10 @@ def _table(rows: list[dict], kind: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=storage.COLUMNS[kind])
 
 
-def build_chart(df: pd.DataFrame, interval: str, n: int, off: float, levels: list[tuple[str, float]], name: str) -> dict:
+def build_chart(
+    df: pd.DataFrame, interval: str, n: int, off: float, levels: list[tuple[str, float]], name: str,
+    abcd: harmonics.Projection | None = None,
+) -> dict:
     view = df.iloc[-n:].copy()
     for col in ("open", "high", "low", "close", "ema9", "ema26", "ema50", "ema200", "bb_up", "bb_low"):
         view[col] = view[col] + off
@@ -49,6 +52,10 @@ def build_chart(df: pd.DataFrame, interval: str, n: int, off: float, levels: lis
     lo, hi = float(view["low"].min()), float(view["high"].max())
     pad = (hi - lo) * 0.05
     marks = [{"name": nm, "yAxis": lvl} for nm, lvl in levels if lo - pad <= lvl <= hi + pad]
+    pivots = []
+    if abcd is not None and interval == "H4":
+        pivots = [{"name": label, "coord": [point.time.strftime(fmt), point.price + off]}
+                  for label, point in zip("ABC", (abcd.a, abcd.b, abcd.c)) if point.time in view.index]
 
     def line(col: str, label: str, color: str, axis: int = 0, dashed: bool = False) -> dict:
         return {
@@ -91,6 +98,8 @@ def build_chart(df: pd.DataFrame, interval: str, n: int, off: float, levels: lis
                     "label": {"formatter": "{b}: {c}", "position": "insideStartTop", "fontSize": 10},
                     "lineStyle": {"color": "#7e57c2", "type": "dashed", "width": 1},
                 },
+                "markPoint": {"data": pivots, "symbol": "circle", "symbolSize": 20,
+                              "itemStyle": {"color": "#7e57c2"}, "label": {"formatter": "{b}", "color": "#fff"}},
             },
             line("ema9", "EMA 9", "#2962ff"),
             line("ema26", "EMA 26", "#ff9800"),
@@ -301,12 +310,15 @@ def render_replay_tab(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFram
 
 def render_entry_watches(
     inst: Instrument, cfg: dict, scenarios: dict[str, tuple[float, float, float]],
-    volume: float, limit_h: float, cost: float, min_rr: float,
+    volume: float, limit_h: float, cost: float, min_rr: float, frames: dict[str, pd.DataFrame], off: float,
 ) -> None:
     k, dec = inst.key, inst.decimals
     watches = cfg["obserwacje wejścia"]
     sent = notify.load_state(k).get("obserwacje wejścia", {})
     now = pd.Timestamp.now(tz=data.TZ_LOCAL)
+    h1 = frames["H1"]
+    latest = h1.iloc[-1]
+    latest_closed = signals.last_closed(h1, "H1", now)
     st.markdown("#### Obserwuj wejście")
     st.caption(
         "Zapisz poziomy z karty Long lub Short. Monitor sprawdzi świecę H1 zamkniętą po zapisaniu obserwacji "
@@ -322,7 +334,36 @@ def render_entry_watches(
                 signal = sent.get(watch["id"])
                 if signal:
                     closed = pd.Timestamp(signal["świeca"]).tz_convert(data.TZ_LOCAL)
-                    st.success(f"Sygnał H1 {closed:%d.%m %H:%M} po {_num(signal['cena'], dec)}. Zysk/ryzyko {signal['rr']:.2f}.")
+                    if "ekstremum odrzucenia" in signal:
+                        reaction = plan.watch_rejection_text(direction, watch["próg"], signal["ekstremum odrzucenia"], signal["cena"], dec)
+                        st.success(f"OTWÓRZ {direction.upper()} · {closed:%d.%m %H:%M}\n\n{reaction} Zysk do ryzyka {signal['rr']:.2f}:1 po kosztach.")
+                    else:
+                        st.success(f"Sygnał H1 {closed:%d.%m %H:%M} po {_num(signal['cena'], dec)}. Zysk/ryzyko {signal['rr']:.2f}.")
+                elif now < expires and watch.get("odrzucenie H1"):
+                    created = pd.Timestamp(watch["utworzono"])
+                    sign = 1 if direction == "long" else -1
+                    level = watch["próg"]
+                    closed_since_creation = latest_closed is not None and latest_closed.name >= created
+                    if (latest.name >= created and not data.bar_closed("H1", latest.name, now)
+                            and plan.watch_rejects_level(direction, watch, latest, off)):
+                        st.info("CZEKAJ NA ZAMKNIĘCIE H1 · Cena przebiła poziom i wróciła. Świeca nadal trwa.")
+                    elif closed_since_creation and plan.watch_rejects_level(direction, watch, latest_closed, off):
+                        when = data.bar_end("H1", latest_closed.name)
+                        price = float(latest_closed["close"]) + off
+                        candidate = plan.entry_signal(direction, watch, frames, price, when)
+                        extreme = float(latest_closed["low" if direction == "long" else "high"]) + off
+                        reaction = plan.watch_rejection_text(direction, watch["próg"], extreme, price, dec)
+                        if candidate is None:
+                            st.info(f"CZEKAJ · {reaction} Trend H4/D1 lub parametry planu nie potwierdzają wejścia.")
+                        elif candidate["rr"] < watch["min rr"]:
+                            st.info(f"CZEKAJ · {reaction} Zysk do ryzyka {candidate['rr']:.2f}:1 przy wymaganym {watch['min rr']:g}:1.")
+                        else:
+                            st.success(f"OTWÓRZ {direction.upper()} · {reaction} Zysk do ryzyka {candidate['rr']:.2f}:1 po kosztach.")
+                    elif (closed_since_creation and (latest_closed["open"] + off - level) * sign > 0
+                          and (latest_closed["close"] + off - level) * sign < 0):
+                        st.info("CZEKAJ · H1 zamknęła się po drugiej stronie poziomu. Brak odrzucenia.")
+                    else:
+                        st.caption("CZEKAJ NA ODRZUCENIE POZIOMU · Monitor czeka na przebicie i powrót na zamkniętej H1.")
                 else:
                     st.caption("Obserwacja wygasła." if now >= expires else "Czeka na spełnienie warunków.")
                 st.caption(
@@ -335,6 +376,10 @@ def render_entry_watches(
                     st.rerun()
             else:
                 with st.form(f"watch_{k}_{direction}"):
+                    require_rejection = st.checkbox(
+                        "Wymagaj odrzucenia progu na H1", key=f"watch_rejection_{k}_{direction}",
+                        help="Świeca musi przebić próg i zamknąć się po tej samej stronie, po której się otworzyła.",
+                    )
                     expires_at = st.datetime_input(
                         "Ważny do (czas polski)", value=(now.tz_localize(None).floor("min") + pd.Timedelta(days=1)).isoformat(),
                         format="DD/MM/YYYY", required=True, key=f"watch_expiry_{k}_{direction}",
@@ -349,10 +394,45 @@ def render_entry_watches(
                             if not isinstance(expires, pd.Timestamp) or expires <= now:
                                 errors.append("wybierz przyszłą, jednoznaczną godzinę w czasie polskim")
                             if isinstance(expires, pd.Timestamp) and not errors:
-                                watches[direction] = plan.new_watch(entry, sl, tp, volume, limit_h, cost, min_rr, now, expires)
+                                watches[direction] = plan.new_watch(
+                                    entry, sl, tp, volume, limit_h, cost, min_rr, now, expires,
+                                    require_rejection=require_rejection,
+                                )
                                 storage.save_settings(cfg, k)
                                 st.rerun()
                             st.error("Popraw obserwację: " + ", ".join(errors))
+
+
+def render_rejection_history(inst: Instrument, frames: dict[str, pd.DataFrame], limit_h: float, cost: float) -> None:
+    details = st.expander("Test H1 · Dotknięcie a odrzucenie", on_change="rerun", key=f"rejection_history_{inst.key}")
+    if not details.open:
+        return
+    with details:
+        st.caption(
+            "Poziomy to minimum i maksimum ostatniej zakończonej sesji D1. Wejście na następnym otwarciu H1. "
+            f"SL 1 ATR · TP 2 ATR · limit {limit_h:g} godz. · koszt {cost:g} pkt na pozycję. "
+            "Każdy przypadek jest oceniany osobno, także gdy pozycje nakładają się w czasie."
+        )
+        trades = backtest.rejection_history(frames, limit_h, cost)
+        if trades.empty:
+            st.info("Brak zakończonych przypadków do porównania.")
+            return
+        rows = []
+        for direction in ("LONG", "SHORT"):
+            by_direction = trades[trades["kierunek"] == direction]
+            for label, sample in (("Dotknięcie", by_direction), ("Odrzucenie", by_direction[by_direction["odrzucenie"]])):
+                count = len(sample)
+                wins = int((sample["wynik"] == "TP").sum())
+                rows.append({
+                    "Kierunek": direction, "Warunek": label, "Przypadki": count, "TP": wins,
+                    "SL": int((sample["wynik"] == "SL").sum()),
+                    "Limit": int((sample["wynik"] == "limit").sum()),
+                    "TP przed SL": f"{wins / count:.1%}" if count >= backtest.MIN_SAMPLE else "Za mało danych",
+                    "Średni wynik po kosztach [pkt]": sample["wynik [pkt]"].mean(),
+                })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Porównanie dotknięć i odrzuceń na H1",
+                     column_config={"Średni wynik po kosztach [pkt]": st.column_config.NumberColumn(format="%.2f")})
+        st.caption(f"Dotknięcia obejmują odrzucenia. Odsetek TP pokazujemy od {backtest.MIN_SAMPLE} rozstrzygniętych przypadków.")
 
 
 def render_plan_tab(
@@ -437,7 +517,8 @@ def render_plan_tab(
                 f"Przy mniej niż {backtest.MIN_SAMPLE} przypadkach pokazujemy „za mało danych”."
             )
 
-    render_entry_watches(inst, cfg, scen, vol, limit_h, cost, min_rr)
+    render_entry_watches(inst, cfg, scen, vol, limit_h, cost, min_rr, frames, off)
+    render_rejection_history(inst, frames, limit_h, cost)
 
     # -------------------------------------------------------- ten plan na historii
     st.markdown("#### Sprawdź ten plan na historii")
@@ -661,6 +742,55 @@ def render_simulation(
         )
 
 
+def render_harmonics(
+    inst: Instrument, cfg: dict, off: float, price: float, h1: pd.DataFrame,
+    patterns: list[harmonics.Projection], status: harmonics.Status | None,
+) -> None:
+    st.subheader("Układ harmoniczny AB=CD")
+    enabled = bool(cfg.get(harmonics.ALERT_SETTING))
+    alerts = st.checkbox("Powiadamiaj o zmianie etapu AB=CD", value=enabled, key=f"abcd_alerts_{inst.key}")
+    if alerts != enabled:
+        cfg[harmonics.ALERT_SETTING] = alerts
+        storage.save_settings(cfg, inst.key)
+
+    if not patterns or status is None:
+        st.info("Brak potwierdzonych punktów A, B i C spełniających warunki AB=CD.")
+        return
+    projection = patterns[-1]
+    title, body = harmonics.describe(projection, status, off, inst.decimals)
+    st.info(body, title=title)
+    lower, upper = projection.zone
+    if status.stage == "building":
+        distance = max(lower + off - price, price - upper - off, 0.0)
+        st.caption(f"Odległość bieżącej ceny od strefy D · {_num(distance, inst.decimals)}.")
+    table = pd.DataFrame([
+        {"Punkt": label, "Cena": _num(point.price + off, inst.decimals),
+         "Świeca H4": point.time.tz_convert(data.TZ_LOCAL).strftime("%d.%m.%Y %H:%M"),
+         "Potwierdzenie": point.confirmed_at.tz_convert(data.TZ_LOCAL).strftime("%d.%m.%Y %H:%M")}
+        for label, point in zip("ABC", (projection.a, projection.b, projection.c))
+    ] + [{"Punkt": "D · projekcja", "Cena": _num(projection.d + off, inst.decimals), "Świeca H4": "—", "Potwierdzenie": "—"}])
+    st.dataframe(table, hide_index=True, alt="Punkty i czasy potwierdzenia układu AB=CD")
+    st.caption(f"Ostatnia zmiana etapu · {status.at.tz_convert(data.TZ_LOCAL):%d.%m.%Y %H:%M} (czas polski).")
+
+    history = st.expander("Poprzednie układy AB=CD", key=f"abcd_history_{inst.key}", on_change="rerun")
+    if history.open:
+        with history:
+            rows = []
+            recent = patterns[-31:]
+            for old, next_pattern in reversed(list(zip(recent, recent[1:]))):
+                old_status = harmonics.track(old, h1, next_pattern.c.confirmed_at)
+                label, _ = harmonics.describe(old, old_status, off, inst.decimals)
+                rows.append({
+                    "Potwierdzenie C (czas polski)": old.c.confirmed_at.tz_convert(data.TZ_LOCAL).strftime("%d.%m.%Y %H:%M"),
+                    "Cel D": _num(old.d + off, inst.decimals),
+                    "Stan przed kolejną projekcją": label.removeprefix("AB=CD · "),
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Ostatnie projekcje AB=CD na historii świec")
+            else:
+                st.caption("Brak wcześniejszych układów w dostępnej historii.")
+
+
 def render(inst: Instrument) -> None:
     k = inst.key
     dec = inst.decimals
@@ -771,6 +901,10 @@ def render(inst: Instrument) -> None:
     prev_close = float(frames["D1"]["close"].iloc[-2]) + off if len(frames["D1"]) >= 2 else None
     d1, h4, h1 = frames["D1"].iloc[-1], frames["H4"].iloc[-1], frames["H1"].iloc[-1]
     levels = [(str(x["nazwa"]), float(x["poziom"])) for x in cfg["poziomy"] if x.get("poziom")]
+    pattern_now = pd.Timestamp.now(tz="UTC")
+    abcd_patterns = harmonics.projections(frames["H4"], pattern_now)
+    abcd = abcd_patterns[-1] if abcd_patterns else None
+    abcd_status = harmonics.track(abcd, frames["H1"], pattern_now) if abcd else None
 
     # ------------------------------------------------------------ KPI
     with st.container(horizontal=True):
@@ -832,8 +966,11 @@ def render(inst: Instrument) -> None:
             else:
                 st.caption(f"{interval} · początek ostatniej świecy: {chart_frame.index[-1]:%d.%m.%Y %H:%M} (czas polski).")
     if chart_frame is not None and not chart_frame.empty:
+        chart_levels = levels
+        if abcd and interval in ("H1", "H4"):
+            chart_levels = [*levels, ("AB=CD · D", abcd.d + off)]
         st.echarts_chart(
-            build_chart(chart_frame, interval, bars, off, levels, inst.name),
+            build_chart(chart_frame, interval, bars, off, chart_levels, inst.name, abcd),
             height=640,
             alt=f"Wykres świecowy {inst.name} {interval} z EMA, Bollingerem, RSI i MACD",
         )
@@ -864,6 +1001,7 @@ def render(inst: Instrument) -> None:
             )
 
     with tab_fib:
+        render_harmonics(inst, cfg, off, price, frames["H1"], abcd_patterns, abcd_status)
         lo_v, lo_t, hi_v, hi_t = ind.auto_fib_swing(frames["D1"])
         top_v, top_t, bot_v, bot_t = ind.auto_fib_decline(frames["D1"])
         st.markdown(

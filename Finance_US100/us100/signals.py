@@ -124,6 +124,13 @@ def level_hits(low, high, open_, prev_close, level: float):
     return touched, gap
 
 
+def rejects_level(open_, high, low, close, level, direction: str):
+    """Otwarcie i zamknięcie po tej samej stronie, ekstremum po przeciwnej."""
+    if direction == "long":
+        return (open_ > level) & (low < level) & (close > level)
+    return (open_ < level) & (high > level) & (close < level)
+
+
 def evaluate_rules(rules: list[dict], frames: dict[str, pd.DataFrame], offset: float) -> pd.DataFrame:
     """Reguły oceniane wyłącznie na zamkniętych świecach; bez zamkniętej świecy reguła jest pomijana."""
     rows = []

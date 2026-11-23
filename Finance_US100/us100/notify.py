@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from . import delivery
+from . import harmonics
 from . import indicators as ind
 from . import plan
 from .instruments import ALL, price_text
@@ -204,15 +205,38 @@ def check_events(
         if signal["rr"] < watch["min rr"]:
             title = f"{direction.upper()}: zysk do ryzyka poniżej minimum"
             ratio += f" Twoje minimum to {watch['min rr']:g} do 1."
-        text = (
+        context = (
             f"Świeca H1 zamknęła się o {pd.Timestamp(signal['świeca']).tz_convert('Europe/Warsaw'):%d.%m %H:%M} "
-            f"na {_fmt(signal['cena'], instrument)}. Próg z planu: {_fmt(watch['próg'], instrument)}.\n"
+            f"na {_fmt(signal['cena'], instrument)}. Próg z planu: {_fmt(watch['próg'], instrument)}."
+        )
+        if "ekstremum odrzucenia" in signal:
+            title = f"H1 · OTWÓRZ {direction.upper()}"
+            context = plan.watch_rejection_text(
+                direction, watch["próg"], signal["ekstremum odrzucenia"], signal["cena"], inst.decimals if inst else 2,
+            )
+        text = (
+            f"{context}\n"
             f"Stop loss (SL): {_fmt(watch['sl'], instrument)}. Cel zysku (TP): {_fmt(watch['tp'], instrument)}.\n"
             f"{ratio} Sprawdź „Plan pozycji”."
         )
         event = make_event(title, text, instrument)
         event["id"] = f"wejscie-{instrument}-{watch['id']}"
         events.append(event)
+
+    if cfg.get(harmonics.ALERT_SETTING):
+        checked_at = pd.Timestamp.now(tz="UTC")
+        patterns = harmonics.projections(frames["H4"], checked_at)
+        new_state["AB=CD"] = None
+        if patterns:
+            projection = patterns[-1]
+            status = harmonics.track(projection, h1, checked_at)
+            signature = {"id": projection.id, "etap": status.stage}
+            new_state["AB=CD"] = signature
+            if "AB=CD" in state and state["AB=CD"] != signature:
+                title, body = harmonics.describe(projection, status, off, inst.decimals if inst else 2)
+                event = make_event(title, body, instrument)
+                event["id"] = f"abcd-{instrument}-{projection.id}-{status.stage}"
+                events.append(event)
 
     new_state["ostatni_bar"] = str(h1.index[-1])
     new_state["cena"] = price

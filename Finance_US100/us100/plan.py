@@ -17,7 +17,7 @@ import pandas as pd
 from . import indicators as ind
 from .data import bar_end
 from .instruments import price_text
-from .signals import NO_DATA, last_closed, trend_series
+from .signals import NO_DATA, last_closed, rejects_level, trend_series
 
 DIRECTIONS = ("long", "short")
 
@@ -147,11 +147,26 @@ def evaluate_scenario(
 
 def new_watch(
     entry: float, sl: float, tp: float, volume: float, limit_h: float, cost: float, min_rr: float,
-    created: pd.Timestamp, expires: pd.Timestamp,
+    created: pd.Timestamp, expires: pd.Timestamp, *, require_rejection: bool = False,
 ) -> dict:
     return {"id": uuid.uuid4().hex, "próg": entry, "sl": sl, "tp": tp, "wolumen": volume,
             "limit godzin": limit_h, "koszt pkt": cost, "min rr": min_rr,
-            "utworzono": created.isoformat(), "ważny do": expires.isoformat()}
+            "utworzono": created.isoformat(), "ważny do": expires.isoformat(),
+            "odrzucenie H1": require_rejection}
+
+
+def watch_rejects_level(direction: str, watch: dict, bar: pd.Series, off: float) -> bool:
+    return bool(rejects_level(bar["open"] + off, bar["high"] + off, bar["low"] + off,
+                              bar["close"] + off, watch["próg"], direction))
+
+
+def watch_rejection_text(direction: str, level: float, extreme: float, close: float, decimals: int) -> str:
+    level_text = price_text(level, decimals)
+    extreme_text = price_text(extreme, decimals)
+    close_text = price_text(close, decimals)
+    if direction == "long":
+        return f"Cena zeszła pod wsparcie {level_text} do {extreme_text} i wróciła nad poziom. H1 zamknęła się na {close_text}."
+    return f"Cena przebiła sufit {level_text}, doszła do {extreme_text} i wróciła pod poziom. H1 zamknęła się na {close_text}."
 
 
 def check_entry_watches(
@@ -172,10 +187,18 @@ def check_entry_watches(
         if bar is None or now >= pd.Timestamp(watch["ważny do"]):
             continue
         when = bar_end("H1", bar.name)
-        if when <= pd.Timestamp(watch["utworzono"]):
+        created = pd.Timestamp(watch["utworzono"])
+        if when <= created:
+            continue
+        rejection = watch.get("odrzucenie H1", False)
+        if rejection and (bar.name < created or not watch_rejects_level(direction, watch, bar, off)):
             continue
         signal = entry_signal(direction, watch, frames, float(bar["close"]) + off, when)
         if signal is not None:
+            if rejection:
+                if signal["rr"] < watch["min rr"]:
+                    continue
+                signal["ekstremum odrzucenia"] = float(bar["low" if direction == "long" else "high"]) + off
             new_events[direction] = sent[watch_id] = signal
     return new_events, sent
 
