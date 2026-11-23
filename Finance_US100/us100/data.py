@@ -30,9 +30,10 @@ _OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 def _history(ticker: str, period: str, interval: str) -> pd.DataFrame:
     df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+    if not df.empty:
+        df = df[_OHLCV].dropna(subset=["Open", "High", "Low", "Close"])
     if df.empty:
         raise RuntimeError(f"Brak danych z Yahoo Finance dla {ticker} ({interval}).")
-    df = df[_OHLCV].dropna(subset=["Open", "High", "Low", "Close"])
     df.columns = [c.lower() for c in df.columns]
     return df
 

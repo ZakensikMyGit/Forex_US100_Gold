@@ -53,29 +53,34 @@ def write_json(path: Path, obj) -> None:
 
 
 @contextmanager
-def queue_lock(timeout: float = 15.0):
-    """Blokada kolejki - panel i monitor mogą wysyłać w tym samym czasie."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def file_lock(path: Path, timeout: float = 15.0):
+    """Blokada między procesami z odzyskiwaniem po przerwanym zapisie."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
     fd = None
     while fd is None:
         try:
-            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             try:  # blokada po przerwanym procesie
-                if time.time() - LOCK_PATH.stat().st_mtime > 120:
-                    LOCK_PATH.unlink(missing_ok=True)
+                if time.time() - path.stat().st_mtime > 120:
+                    path.unlink(missing_ok=True)
                     continue
             except OSError:
                 pass
             if time.monotonic() > deadline:
-                raise TimeoutError("Kolejka powiadomień jest zablokowana przez inny proces.")
+                raise TimeoutError(f"Plik {path.name} jest zablokowany przez inny proces.")
             time.sleep(0.2)
     try:
         yield
     finally:
         os.close(fd)
-        LOCK_PATH.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+
+
+def queue_lock(timeout: float = 15.0):
+    """Blokada kolejki - panel i monitor mogą wysyłać w tym samym czasie."""
+    return file_lock(LOCK_PATH, timeout)
 
 
 # ---------------------------------------------------------------- Telegram w Menedżerze poświadczeń

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finance US100 i złoto — funkcje aplikacji i kierunki rozwoju</title>
+<style>
+  :root { color-scheme: light; --ink:#142634; --muted:#41586b; --line:#bdccd4; --tint:#eef6f5; --accent:#0b635e; }
+  * { box-sizing:border-box; }
+  body { margin:0; color:var(--ink); background:#f4f7f8; font:1rem/1.55 system-ui,sans-serif; }
+  main { max-width:1080px; margin:auto; padding:36px clamp(14px,4vw,40px); }
+  header, section { margin-bottom:24px; }
+  section { background:white; border:1px solid var(--line); border-radius:14px; padding:clamp(13px,3vw,26px); }
+  h1,h2,h3,p,figure { margin:0; }
+  h1 { font-size:clamp(1.8rem,5vw,2.7rem); line-height:1.15; }
+  h2 { font-size:1.45rem; line-height:1.25; margin-bottom:12px; }
+  h3 { margin:18px 0 6px; font-size:1.08rem; }
+  p + p,.diagram + p { margin-top:10px; }
+  header p, nav { margin-top:14px; }
+  nav { display:flex; gap:6px 18px; flex-wrap:wrap; }
+  a { color:var(--accent); text-underline-offset:.2em; }
+  code { overflow-wrap:anywhere; font-size:.88em; }
+  .diagram { display:grid; gap:6px; margin:14px 0; }
+  .node { border:1px solid var(--line); border-radius:9px; background:#f8fafb; padding:10px; text-align:center; display:grid; align-content:center; }
+  .primary { background:var(--tint); border-color:#86b7ae; }
+  .node small,.source { color:var(--muted); }
+  .node small { display:block; line-height:1.4; margin-top:3px; }
+  .branches { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(175px,100%),1fr)); gap:10px; }
+  .arrow { text-align:center; color:var(--accent); font-weight:700; line-height:1.25; }
+  figcaption,.source { font-size:.88rem; }
+  ul,ol { padding-inline-start:1.3rem; margin:8px 0; }
+  li + li { margin-top:8px; }
+  @media print {
+    body { background:white; }
+    main { padding:0; }
+    nav { display:none; }
+    section { border:0; padding:0; }
+    figure,li { break-inside:avoid; }
+    h2,h3 { break-after:avoid; }
+  }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Finance US100 i złoto</h1>
+  <p>Panel Streamlit pokazuje analizę techniczną, scenariusze wyniku pozycji i historię alertów. Oddzielny monitor sprawdza oba instrumenty w tle i może wysyłać powiadomienia Windows oraz Telegram. Oba procesy korzystają z tego samego kodu przygotowania danych i oceny reguł.</p>
+  <nav aria-label="Spis treści">
+    <a href="#panel">Funkcje panelu</a><a href="#dane">Przepływ danych</a><a href="#monitor">Monitor alertów</a><a href="#ryzyko">Wynik pozycji</a><a href="#rozwoj">Rozwój aplikacji</a>
+  </nav>
+</header>
+
+<section id="panel">
+  <h2>1. Mapa funkcji panelu</h2>
+  <figure class="diagram" aria-label="Wybór instrumentu prowadzi do wspólnego widoku z pięcioma grupami funkcji">
+    <div class="node primary"><strong>Wybór instrumentu</strong><small>US100 lub Złoto · wspólny widok, osobne ustawienia</small></div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="branches">
+      <div class="node"><strong>Przegląd rynku</strong><small>Cena i USD/PLN, wskaźniki kontekstowe, trend, dywergencje, wykres D1/H4/H1</small></div>
+      <div class="node"><strong>Reguły i Fibonacci</strong><small>Zamknięcia powyżej lub poniżej progu, fale automatyczne i ręczne, poziomy w zasięgu 2× ATR D1</small></div>
+      <div class="node"><strong>Ryzyko pozycji</strong><small>Wynik long i short przy wybranych cenach, stop-loss według ATR H1 i D1</small></div>
+      <div class="node"><strong>Powiadomienia</strong><small>Ostatnie sprawdzenie, historia, konfiguracja Telegrama i wysyłka testowa</small></div>
+      <div class="node"><strong>Ustawienia</strong><small>Poziomy, reguły, fale i pozycje w lokalnych plikach JSON. Korekta ceny i odświeżanie w panelu bocznym</small></div>
+    </div>
+  </figure>
+  <p class="source">Kod: <a href="streamlit_app.py">streamlit_app.py</a>, <a href="us100/dashboard.py">us100/dashboard.py</a>, <a href="us100/storage.py">us100/storage.py</a>.</p>
+</section>
+
+<section id="dane">
+  <h2>2. Od notowań do wykresu i sygnałów</h2>
+  <figure class="diagram" aria-label="Notowania Yahoo Finance są przetwarzane na świece D1, H1 i H4, po czym trafiają do panelu i monitora">
+    <div class="node primary"><strong>Yahoo Finance</strong><small>NQ=F dla US100 · GC=F dla złota. Kontrakty terminowe służą za przybliżenie kursów z xStation.</small></div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="branches">
+      <div class="node"><strong>D1</strong><small>Dzienna historia z 5 lat. Daty sesji według czasu Nowego Jorku.</small></div>
+      <div class="node"><strong>H1</strong><small>Historia godzinowa z okna 730 dni. Indeks w czasie warszawskim.</small></div>
+      <div class="node"><strong>H4</strong><small>Agregacja H1 co 4 godziny od lokalnego początku dnia.</small></div>
+    </div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="node primary"><strong>Wspólne obliczenia dla każdego interwału</strong><small>EMA 9/26/50/200 · RSI 14 · MACD · wstęgi Bollingera · ATR 14</small></div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="branches">
+      <div class="node"><strong>Panel Streamlit</strong><small>Bufor 300 sekund. Osobno pobiera USD/PLN oraz VIX dla US100 lub DXY i rentowność 10-letnią USA dla złota.</small></div>
+      <div class="node"><strong>Monitor</strong><small>Pobiera świece przy każdym cyklu dla obu instrumentów.</small></div>
+    </div>
+  </figure>
+  <p>Panel i monitor stosują zapisane przesunięcie przy porównywaniu ceny z ręcznie ustawionymi progami. Panel przesuwa też świece i nakładki cenowe na wykresie. Użytkownik może wpisać różnicę albo pozwolić panelowi wyliczyć ją z ręcznie podanej ceny xStation i ostatniej ceny H1.</p>
+  <p class="source">Kod: <a href="us100/instruments.py">us100/instruments.py</a>, <a href="us100/data.py">us100/data.py</a>, <a href="us100/engine.py">us100/engine.py</a>, <a href="us100/indicators.py">us100/indicators.py</a>.</p>
+</section>
+
+<section id="monitor">
+  <h2>3. Cykl monitorowania i generowania alertów</h2>
+  <figure class="diagram" aria-label="Monitor pobiera dane i poprzedni stan, ocenia cztery typy zdarzeń, wysyła alerty i zapisuje stan">
+    <div class="node primary"><strong>Start cyklu · domyślnie co 300 s</strong><small>Dla każdego instrumentu monitor wczytuje ustawienia, świece i poprzedni stan. Błąd jednego instrumentu trafia do logu, a cykl przechodzi do kolejnego.</small></div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="branches">
+      <div class="node"><strong>Reguły cenowe</strong><small>Przejście ze stanu niespełnionego do spełnionego według ostatniej zamkniętej świecy.</small></div>
+      <div class="node"><strong>Dywergencje</strong><small>Nowy wpis RSI lub MACD. Zdarzenie może mieć status „w budowie” lub „potwierdzona”.</small></div>
+      <div class="node"><strong>Strefy RSI</strong><small>Wejście lub wyjście z obszaru poniżej 30 albo powyżej 70 na zamkniętych H1 i H4.</small></div>
+      <div class="node"><strong>Dotknięcie poziomu</strong><small>Próg w łącznym zakresie min–max okna H1 od zapamiętanej świecy. Cztery godziny przerwy dla tego samego poziomu.</small></div>
+    </div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="node primary"><strong>Wysyłka i zapis</strong><small>Windows, opcjonalnie Telegram, historia ze statusem wysyłki w powiadomienia.jsonl. Następnie zapis stanu instrumentu i wpis w monitor.log.</small></div>
+    <figcaption>Pierwszy cykl dla instrumentu bez stanu zapisuje stan początkowy i wysyła komunikat startowy. Kolejne cykle porównują wyniki z zapisanym stanem.</figcaption>
+  </figure>
+  <p>Panel pokazuje bieżące wartości z ostatnich dostępnych świec, które mogą być otwarte. Reguły cenowe i alerty RSI korzystają z funkcji <code>last_closed</code>. Dywergencje oraz zakresy cen używane do wykrywania dotknięcia mogą uwzględniać świecę w trakcie formowania.</p>
+  <p class="source">Kod: <a href="monitor.py">monitor.py</a>, <a href="us100/notify.py">us100/notify.py</a>, <a href="us100/signals.py">us100/signals.py</a>.</p>
+</section>
+
+<section id="ryzyko">
+  <h2>4. Obliczanie wyniku pozycji i poziomów stop-loss</h2>
+  <figure class="diagram" aria-label="Pozycje, poziomy cenowe, kurs walutowy i ATR tworzą dwa zestawy obliczeń">
+    <div class="node primary"><strong>Dane wejściowe</strong><small>Ręczne pozycje, lokalne poziomy, ostatnia cena po korekcie, wartość punktu, USD/PLN i ATR</small></div>
+    <div class="arrow" aria-hidden="true">↓</div>
+    <div class="branches">
+      <div class="node"><strong>Scenariusze w PLN</strong><small>Różnica ceny względem wejścia × znak kierunku × wolumen × USD za punkt lota × USD/PLN. Wynik na każdą pozycję i razem.</small></div>
+      <div class="node"><strong>Poziomy stop-loss</strong><small>Od ceny odejmowane są wielokrotności ATR dla long i dodawane dla short. Tabele H1 i D1 pokazują 1×, 1,5×, 2× i 3× ATR.</small></div>
+    </div>
+    <figcaption>Scenariusze dotyczą bieżącej ceny oraz ręcznych poziomów i pomijają koszty transakcji. Dane pozycji użytkownik wpisuje ręcznie.</figcaption>
+  </figure>
+  <p class="source">Kod: <a href="us100/risk.py">us100/risk.py</a>, <a href="us100/dashboard.py">us100/dashboard.py</a>.</p>
+</section>
+
+<section id="rozwoj">
+  <h2>5. Proponowana kolejność rozwoju</h2>
+
+  <h3>Najpierw poprawność danych, sygnałów i obliczeń</h3>
+  <ol>
+    <li><strong>Sprawdzać dotknięcie na każdej świecy.</strong> W <code>notify.check_events</code> łączny zakres kilku świec może objąć cenę przeskoczoną w luce. Porównywać próg z przedziałem low–high każdej świecy, a skok przez poziom ewentualnie raportować jako osobny typ zdarzenia. Kryterium odbioru: świece 94–96 i 104–106 nie wywołują alertu „dotknięcie 100”.</li>
+    <li><strong>Ujednolicić obsługę zamknięć i krótkiej historii.</strong> <code>last_closed</code> próbuje pobrać przedostatni rekord, gdy ostatnia świeca jest otwarta. Zwracać jawny brak danych i pomijać ocenę, gdy nie ma zamkniętej świecy. Sprawdzić granice H4 w zmianę czasu oraz regułę D1, która stosuje godzinę 17:00 czasu Nowego Jorku do obu instrumentów. W panelu oznaczać świecę jako otwartą albo zamkniętą.</li>
+    <li><strong>Doprecyzować obliczenia i sprawdzić dane wpisywane ręcznie.</strong> Płaska seria zwraca RSI 100, bo kod traktuje zerowe straty tak samo także przy zerowych wzrostach. Ustalić oczekiwany wynik dla płaskiej serii i pokryć go testem. Nadać pozycjom własne identyfikatory, ponieważ powtarzająca się nazwa nadpisuje kolumnę przy prawidłowym sumowaniu. Walidować liczby i pola wymagane przed zapisem ustawień.</li>
+    <li><strong>Zapisywać przesunięcie po zatwierdzeniu kalibracji.</strong> Dodatnia cena xStation pozostaje w widżecie i na kolejnych przebiegach panel może ponownie wyliczać przesunięcie po zmianie ceny H1. Dodać przycisk kalibracji i zapisać czasy obu obserwacji, żeby odświeżenie nie zmieniało progów używanych przez monitor.</li>
+  </ol>
+
+  <h3>Następnie odporność na awarie i przerwy</h3>
+  <ol>
+    <li><strong>Wyświetlać jakość i świeżość danych oddzielnie dla źródeł.</strong> Wyjątek podczas pobrania wskaźnika kontekstowego lub USD/PLN zatrzymuje obecnie cały panel, także wykres. Pokazywać czas ostatniej świecy oraz ostatnią poprawną wartość z oznaczeniem wieku. Przy braku USD/PLN wyłączyć wyliczenie w PLN, zachowując wykres i reguły.</li>
+    <li><strong>Utrwalać zdarzenia i ponawiać wysyłkę według kanału.</strong> Monitor zapisuje nowy stan również po zwróceniu błędu przez kanał, więc alert może nie zostać ponowiony. Wprowadzić trwałą kolejkę, stabilny identyfikator zdarzenia i status dostarczenia osobno dla Windows i Telegrama. Aktualizować pliki JSON atomowo i obsłużyć pojedynczy niepoprawny wiersz JSONL przy odczycie historii. W panelu pokazywać wiek ostatniego udanego cyklu i błędy dostarczenia. Token Telegrama przenieść do lokalnego magazynu sekretów dostępnego dla obu procesów.</li>
+    <li><strong>Ograniczyć powtarzane pobieranie i obliczenia.</strong> Monitor pobiera wieloletnią historię w każdym cyklu, a panel wykonuje kod wszystkich zakładek przy ponownym uruchomieniu widoku. Najpierw zmierzyć czas i liczbę pobrań. Następnie odświeżać końcówkę historii z zachowaniem danych potrzebnych do wskaźników i wykonywać cięższe obliczenia zakładek przy ich otwarciu.</li>
+  </ol>
+
+  <h3>Po ustabilizowaniu podstaw</h3>
+  <ol>
+    <li><strong>Odtwarzać alerty na zapisanej historii.</strong> Uruchamiać te same reguły po kolei na historycznych świecach i eksportować czas, źródło, wartość progu i rezultat. Dla potwierdzonych dywergencji zapisywać czas potwierdzenia po wymaganych świecach po prawej stronie ekstremum. Funkcja przyda się do sprawdzania pominiętych i powtarzających się alertów.</li>
+    <li><strong>Rozbudować scenariusze pozycji.</strong> Dodać opcjonalne koszty transakcji, datę kursu walutowego oraz wynik zbiorczy dla obu instrumentów. Zacząć od importu CSV pozycji i eksportu tabeli scenariuszy, żeby ograniczyć ręczne przepisywanie.</li>
+  </ol>
+  <p class="source">Analiza kodu lokalnego i próby na danych syntetycznych potwierdziły alert przy luce, wyjątek przy jednej otwartej świecy, RSI 100 dla płaskiej serii oraz nadpisanie kolumny przez powtórzoną nazwę pozycji. Dane rynkowe na żywo i dostarczanie alertów wymagają osobnej weryfikacji.</p>
+</section>
+</main>
+</body>
+</html>

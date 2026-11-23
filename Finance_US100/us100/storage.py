@@ -99,6 +99,7 @@ for _d in DEFAULTS.values():
     _d.setdefault("plany", [])  # otwarte i zamknięte plany pozycji
     _d.setdefault("obserwacje wejścia", {})  # po jednej dla long i short
     _d.setdefault("powiadomienia AB=CD", False)
+    _d.setdefault("powiadomienia doradcy", False)
     _d.setdefault("symulacja", {})  # parametry automatycznych pozycji wirtualnych
     _d.setdefault("plan_ustawienia", {"koszt_pkt": 0.0, "min_rr": 1.5, "wolumen": 0.01, "limit_h": 24.0})
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import delivery
+from . import advisor, delivery
 from . import harmonics
 from . import indicators as ind
 from . import plan
@@ -237,6 +237,32 @@ def check_events(
                 event = make_event(title, body, instrument)
                 event["id"] = f"abcd-{instrument}-{projection.id}-{status.stage}"
                 events.append(event)
+
+    if cfg.get(advisor.ALERT_SETTING):
+        settings = cfg["plan_ustawienia"]
+        cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+        assessment = advisor.assess(frames, cost, min_rr, live=True)
+        proposal = assessment.proposal
+        previous = state.get("doradca")
+        new_state["doradca"] = previous
+        if proposal and not assessment.reason:
+            signal_at = proposal.at.isoformat()
+            if previous != signal_at:
+                new_state["doradca"] = signal_at
+                if "doradca" in state:
+                    history, group = advisor.comparable(proposal, advisor.replay(frames, cost, min_rr, limit, proposal.at))
+                    if not advisor.history_hold(history):
+                        direction = proposal.level.direction.upper()
+                        body = (
+                            f"H1 odrzuciła {proposal.level.name} ({_fmt(proposal.level.price + off, instrument)}). "
+                            f"Zgodne grupy wskaźników: {proposal.support_count}/3.\n"
+                            f"Cena sygnału {_fmt(proposal.entry + off, instrument)} · SL {_fmt(proposal.stop + off, instrument)} "
+                            f"· TP {_fmt(proposal.target + off, instrument)} · zysk do ryzyka {proposal.rr:.2f}:1 po kosztach.\n"
+                            f"{history.description()} Próba: {group}."
+                        )
+                        event = make_event(f"Doradca · Propozycja {direction}", body, instrument)
+                        event["id"] = f"doradca-{instrument}-{int(proposal.at.timestamp())}"
+                        events.append(event)
 
     new_state["ostatni_bar"] = str(h1.index[-1])
     new_state["cena"] = price

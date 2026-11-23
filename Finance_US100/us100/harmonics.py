@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import pandas as pd
@@ -61,24 +62,28 @@ class Status:
     close: float | None = None
 
 
-def projections(h4: pd.DataFrame, now: pd.Timestamp) -> list[Projection]:
-    """Kolejność odpowiada chwilom, w których potwierdzono punkty C."""
+def confirmed_pivots(h4: pd.DataFrame, now: pd.Timestamp) -> Iterator[Pivot]:
     last = last_closed(h4, "H4", now)
     if last is None:
-        return []
+        return
     closed = h4.loc[:last.name]
     highs, lows = swing_points(closed, k=PIVOT_BARS)
-    pivots: list[Pivot] = []
-    found = []
     for time in highs.index.union(lows.index).sort_values():
         high = time in highs.index
         if high and time in lows.index:
             continue  # świeca z oboma ekstremami nie ujawnia ich kolejności
         price = float(highs[time] if high else lows[time])
         confirmation_bar = closed.index[closed.index.get_loc(time) + PIVOT_BARS]
-        point = Pivot(time, bar_end("H4", confirmation_bar), price, high)
-        if pivots and pivots[-1].high == high:
-            if (price <= pivots[-1].price if high else price >= pivots[-1].price):
+        yield Pivot(time, bar_end("H4", confirmation_bar), price, high)
+
+
+def projections(h4: pd.DataFrame, now: pd.Timestamp) -> list[Projection]:
+    """Kolejność odpowiada chwilom, w których potwierdzono punkty C."""
+    pivots: list[Pivot] = []
+    found = []
+    for point in confirmed_pivots(h4, now):
+        if pivots and pivots[-1].high == point.high:
+            if (point.price <= pivots[-1].price if point.high else point.price >= pivots[-1].price):
                 continue
             pivots[-1] = point
         else:

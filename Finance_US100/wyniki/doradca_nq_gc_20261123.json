@@ -1,0 +1,380 @@
+{
+  "format": 1,
+  "recorded_at_utc": "2026-11-23T14:05:03+00:00",
+  "source": {
+    "repository": "https://github.com/axb0306/cme-futures-ohlc",
+    "provider_reported_by_repository": "TopstepX",
+    "timestamps": "UTC in CSV; converted to Europe/Warsaw for H1; D1 reconstructed from H1 by America/New_York session",
+    "continuous_contract_roll": "as supplied; no back-adjustment added",
+    "input_files": [
+      {
+        "path": "NQ/NQ_1h_20250321_20260415.csv",
+        "git_blob": "bc84dfc0f54714e94f55ad10f82c86021f338a49",
+        "sha256": "324da92b1e3967caeb9a45f7a34dfcb93ecb56179af8d928007a0d8e64e56676",
+        "role": "used"
+      },
+      {
+        "path": "GC/GC_1h_20250321_20260415.csv",
+        "git_blob": "ff533fece10ae251765bbca0a9fd234ce443cd4a",
+        "sha256": "21ad4f25ec301aca22675eb8b6afded24e16cd3910a76d1f7f85e6986fc173d1",
+        "role": "used"
+      },
+      {
+        "path": "NQ/NQ_daily_20250324_20260414.csv",
+        "git_blob": "c1ae07bba4f98d0c5a05028441dd65604f1cc70f",
+        "role": "source audit only: inconsistent daily series excluded from the test",
+        "sha256": "4b04921620ca15e1a90a4283460a385e0d64943b139f20856026a389a3b88f17"
+      },
+      {
+        "path": "GC/GC_daily_20250324_20260414.csv",
+        "git_blob": "5b2265654fe89dea9da4feede1245ff8be74e7e1",
+        "role": "source audit only: inconsistent daily series excluded from the test",
+        "sha256": "a148145b66f5df5a4d8b7b77896362695aa13decb80f84263be42642ededa95a"
+      }
+    ]
+  },
+  "code": {
+    "base_commit": "07e85ea61f87e0f72c35888f2a1499d35d95f02b",
+    "sha256": {
+      "us100/__init__.py": "7b9d00532335a563cf76d16527292f14d5ba170c677ec828de1d611fcdd72c1b",
+      "us100/advisor.py": "573c2463b36fc4526133f2ce0eb8d9b59fe0bce0f1330fbdcb9f665ee624b282",
+      "us100/archive.py": "4af68384f38b253cb36380fd2e1830460afd104b4014b074958aa918423fd7e4",
+      "us100/backtest.py": "2e7245a5415ea1cc8727bdf9c2ba42131969684d09feaeb24cfc0cd5f2fe16eb",
+      "us100/dashboard.py": "78ecde8bddad6700770bb9dbd3fd7e8e56a06a9787328fba0c9a283a98769b4a",
+      "us100/data.py": "2a63e874cde2fa4660f545eac95aefd8a8eff3b4f92c26157ebef8466a1f4af6",
+      "us100/delivery.py": "686b10e60c9b1f0757fb82320e443ab8c763b0fc43fedd33414eae7fbbfa2497",
+      "us100/engine.py": "216828ca819fbddc99fec72e6e2f535dc0794ac99adc67a4da9228562c32f7a5",
+      "us100/harmonics.py": "b0bec0f8bcf276e916fa997d4b49ace049576f2a58c94834c922cf13ad6ab1eb",
+      "us100/indicators.py": "cf6ddcea33f764f9ba104c84c0782d989d6dce2142b7cd2d29d0f578b566fae3",
+      "us100/instruments.py": "ca76e919f4c6bd4cf17e1c272339c600654574959954a22408eb469e6c0a0263",
+      "us100/journal.py": "72679a34e73b7729a9c8fc21165fce3ed433b808d3b2c8ed382ec804add63b26",
+      "us100/notify.py": "abc6fda4d5da820ac42f403ab96ea76cb39aad807aa46ccf91bfe839bc50af83",
+      "us100/paper.py": "bd8a84d1927a657718525a186cd52db468fb83e92004e79452f7df3a9edc00d4",
+      "us100/plan.py": "8e42ee08e0e939467562be0b3dfe998c7751b341d7d1468b6424d1a8f80f58ad",
+      "us100/risk.py": "78787af0172673fe9b8e2cb17bce253d026b64da5184a629f001869a34a0b284",
+      "us100/signals.py": "c3ac5d8caeff6878d3870fdc6e9329bdfa956403a98450109cc0347702f00a82",
+      "us100/storage.py": "876e382e78c539a535a3dc038293c4f98c12763c1f317fee3baebd8b7f31e97a"
+    }
+  },
+  "protocol": {
+    "initial_history_fraction": 0.4,
+    "test_window_fractions": [
+      0.2,
+      0.2,
+      0.2
+    ],
+    "training_policy": "expanding history; only outcomes known by each window's opening",
+    "execution": "entry on next contiguous H1 open; same levels and execution across variants; one position per variant and instrument",
+    "min_reward_risk_after_costs": 1.5,
+    "position_time_limit_hours": 24,
+    "variants": {
+      "h1_rejection": "price-level rejection, common target and risk geometry",
+      "indicators": "h1_rejection with existing indicators confirmation",
+      "full_advisor": "indicators plus the existing historical-result gate"
+    },
+    "signal_attribution": "window of H1 signal, excluding unresolved positions from results",
+    "scope": "exploratory comparison on reused samples, not independent confirmation"
+  },
+  "instruments": {
+    "NQ": {
+      "input_h1_range": [
+        "2025-03-21T18:00:00+01:00",
+        "2026-04-16T01:00:00+02:00"
+      ],
+      "input_h1_bars": 6270,
+      "derived_d1_bars": 275,
+      "round_trip_cost_price_points": 0.5,
+      "price_point_unit": "Nasdaq index points",
+      "data_note": "one 17:00 ET bar omitted",
+      "totals": {
+        "h1_rejection": {
+          "count": 179,
+          "targets": 43,
+          "stops": 122,
+          "timeouts": 14,
+          "mean_points": -3.1115539412204583,
+          "total_points": -556.9681554785
+        },
+        "indicators": {
+          "count": 44,
+          "targets": 8,
+          "stops": 27,
+          "timeouts": 9,
+          "mean_points": -5.390001853915816,
+          "total_points": -237.1600815723
+        },
+        "full_advisor": {
+          "count": 21,
+          "targets": 5,
+          "stops": 14,
+          "timeouts": 2,
+          "mean_points": -6.013065009093442,
+          "total_points": -126.274365191
+        }
+      },
+      "windows": [
+        {
+          "begin": "2025-08-25T12:00:00+02:00",
+          "end": "2025-11-10T05:00:00+01:00",
+          "previous_h1_bars": 2508,
+          "test_h1_bars": 1254,
+          "candidates_before_position_limit": {
+            "candidates": 92,
+            "pass_indicators": 22,
+            "pass_all": 22
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 66,
+              "targets": 13,
+              "stops": 50,
+              "timeouts": 3,
+              "mean_points": -16.227538520108613,
+              "total_points": -1071.0175423272
+            },
+            "indicators": {
+              "count": 17,
+              "targets": 5,
+              "stops": 10,
+              "timeouts": 2,
+              "mean_points": 3.529457680994015,
+              "total_points": 60.0007805769
+            },
+            "full_advisor": {
+              "count": 17,
+              "targets": 5,
+              "stops": 10,
+              "timeouts": 2,
+              "mean_points": 3.529457680994015,
+              "total_points": 60.0007805769
+            }
+          }
+        },
+        {
+          "begin": "2025-11-10T05:00:00+01:00",
+          "end": "2026-01-29T01:00:00+01:00",
+          "previous_h1_bars": 3762,
+          "test_h1_bars": 1254,
+          "candidates_before_position_limit": {
+            "candidates": 84,
+            "pass_indicators": 17,
+            "pass_all": 2
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 56,
+              "targets": 12,
+              "stops": 39,
+              "timeouts": 5,
+              "mean_points": -9.684537757476262,
+              "total_points": -542.3341144187
+            },
+            "indicators": {
+              "count": 15,
+              "targets": 1,
+              "stops": 10,
+              "timeouts": 4,
+              "mean_points": -41.17326043508874,
+              "total_points": -617.5989065263
+            },
+            "full_advisor": {
+              "count": 2,
+              "targets": 0,
+              "stops": 2,
+              "timeouts": 0,
+              "mean_points": -35.72531055767831,
+              "total_points": -71.4506211154
+            }
+          }
+        },
+        {
+          "begin": "2026-01-29T01:00:00+01:00",
+          "end": "2026-04-16T01:00:00+02:00",
+          "previous_h1_bars": 5016,
+          "test_h1_bars": 1254,
+          "candidates_before_position_limit": {
+            "candidates": 79,
+            "pass_indicators": 13,
+            "pass_all": 2
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 57,
+              "targets": 18,
+              "stops": 33,
+              "timeouts": 6,
+              "mean_points": 18.53304388188381,
+              "total_points": 1056.3835012674
+            },
+            "indicators": {
+              "count": 12,
+              "targets": 2,
+              "stops": 7,
+              "timeouts": 3,
+              "mean_points": 26.703170364761416,
+              "total_points": 320.4380443771
+            },
+            "full_advisor": {
+              "count": 2,
+              "targets": 0,
+              "stops": 2,
+              "timeouts": 0,
+              "mean_points": -57.41226232625195,
+              "total_points": -114.8245246525
+            }
+          }
+        }
+      ]
+    },
+    "GC": {
+      "input_h1_range": [
+        "2025-12-01T01:00:00+01:00",
+        "2026-04-01T02:00:00+02:00"
+      ],
+      "input_h1_bars": 1948,
+      "derived_d1_bars": 84,
+      "round_trip_cost_price_points": 0.2,
+      "price_point_unit": "USD per troy ounce",
+      "data_note": "used December 2025–March 2026 only after identifying anomalous adjacent-hour jumps outside this range",
+      "totals": {
+        "h1_rejection": {
+          "count": 44,
+          "targets": 8,
+          "stops": 32,
+          "timeouts": 4,
+          "mean_points": -11.288420999575417,
+          "total_points": -496.6905239813
+        },
+        "indicators": {
+          "count": 17,
+          "targets": 5,
+          "stops": 10,
+          "timeouts": 2,
+          "mean_points": -2.519424622745402,
+          "total_points": -42.8302185867
+        },
+        "full_advisor": {
+          "count": 17,
+          "targets": 5,
+          "stops": 10,
+          "timeouts": 2,
+          "mean_points": -2.519424622745402,
+          "total_points": -42.8302185867
+        }
+      },
+      "windows": [
+        {
+          "begin": "2026-01-20T03:00:00+01:00",
+          "end": "2026-02-12T01:00:00+01:00",
+          "previous_h1_bars": 779,
+          "test_h1_bars": 389,
+          "candidates_before_position_limit": {
+            "candidates": 17,
+            "pass_indicators": 5,
+            "pass_all": 5
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 15,
+              "targets": 2,
+              "stops": 12,
+              "timeouts": 1,
+              "mean_points": -24.121998787344083,
+              "total_points": -361.8299818102
+            },
+            "indicators": {
+              "count": 5,
+              "targets": 1,
+              "stops": 4,
+              "timeouts": 0,
+              "mean_points": -23.824191231946322,
+              "total_points": -119.1209561597
+            },
+            "full_advisor": {
+              "count": 5,
+              "targets": 1,
+              "stops": 4,
+              "timeouts": 0,
+              "mean_points": -23.824191231946322,
+              "total_points": -119.1209561597
+            }
+          }
+        },
+        {
+          "begin": "2026-02-12T01:00:00+01:00",
+          "end": "2026-03-09T01:00:00+01:00",
+          "previous_h1_bars": 1168,
+          "test_h1_bars": 390,
+          "candidates_before_position_limit": {
+            "candidates": 23,
+            "pass_indicators": 6,
+            "pass_all": 6
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 14,
+              "targets": 4,
+              "stops": 9,
+              "timeouts": 1,
+              "mean_points": -4.009257496962932,
+              "total_points": -56.1296049575
+            },
+            "indicators": {
+              "count": 6,
+              "targets": 2,
+              "stops": 3,
+              "timeouts": 1,
+              "mean_points": 3.3773847007415774,
+              "total_points": 20.2643082044
+            },
+            "full_advisor": {
+              "count": 6,
+              "targets": 2,
+              "stops": 3,
+              "timeouts": 1,
+              "mean_points": 3.3773847007415774,
+              "total_points": 20.2643082044
+            }
+          }
+        },
+        {
+          "begin": "2026-03-09T01:00:00+01:00",
+          "end": "2026-04-01T02:00:00+02:00",
+          "previous_h1_bars": 1558,
+          "test_h1_bars": 390,
+          "candidates_before_position_limit": {
+            "candidates": 25,
+            "pass_indicators": 6,
+            "pass_all": 6
+          },
+          "variants": {
+            "h1_rejection": {
+              "count": 15,
+              "targets": 2,
+              "stops": 11,
+              "timeouts": 2,
+              "mean_points": -5.248729147578405,
+              "total_points": -78.7309372137
+            },
+            "indicators": {
+              "count": 6,
+              "targets": 2,
+              "stops": 3,
+              "timeouts": 1,
+              "mean_points": 9.337738228101713,
+              "total_points": 56.0264293686
+            },
+            "full_advisor": {
+              "count": 6,
+              "targets": 2,
+              "stops": 3,
+              "timeouts": 1,
+              "mean_points": 9.337738228101713,
+              "total_points": 56.0264293686
+            }
+          }
+        }
+      ]
+    }
+  }
+}

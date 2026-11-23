@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from . import backtest, data, delivery, engine, harmonics, indicators as ind, journal, notify, paper, plan, risk, signals, storage
+from . import advisor, backtest, data, delivery, engine, harmonics, indicators as ind, journal, notify, paper, plan, risk, signals, storage
 from .instruments import Instrument
 
 
@@ -742,6 +742,173 @@ def render_simulation(
         )
 
 
+@st.cache_data(ttl=600, max_entries=12, show_spinner="Odtwarzam sygnały doradcy na historii…")
+def advisor_history(
+    frames: dict[str, pd.DataFrame], cost: float, min_rr: float, limit: float, as_of: pd.Timestamp,
+) -> dict[tuple[str, str, int], advisor.History]:
+    return advisor.replay(frames, cost, min_rr, limit, as_of)
+
+
+@st.cache_data(ttl=600, max_entries=12, show_spinner="Porównuję warianty w kolejnych oknach…")
+def advisor_validation(
+    frames: dict[str, pd.DataFrame], cost: float, min_rr: float, limit: float, as_of: pd.Timestamp,
+) -> advisor.WalkForward | None:
+    return advisor.validate_walk_forward(frames, cost, min_rr, limit, as_of)
+
+
+def render_advisor_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame]) -> None:
+    test = st.expander("Porównanie wariantów Doradcy", key=f"advisor_validation_{inst.key}", on_change="rerun")
+    if not test.open:
+        return
+    with test:
+        params = cfg["plan_ustawienia"]
+        cost, min_rr, limit = (float(params[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+        now = pd.Timestamp.now(tz="UTC")
+        closed = {}
+        for interval, frame in frames.items():
+            last = signals.last_closed(frame, interval, now)
+            closed[interval] = frame.iloc[:0] if last is None else frame.loc[:last.name]
+        h1 = closed["H1"]
+        if len(h1) < advisor.MIN_VALIDATION_BARS:
+            st.info(f"Potrzeba co najmniej {advisor.MIN_VALIDATION_BARS} zamkniętych H1. Źródło zawiera {len(h1)}.")
+            return
+        report = advisor_validation(closed, cost, min_rr, limit, data.bar_end("H1", h1.index[-1]))
+        if report is None:
+            st.info("Za mało zamkniętych świec do podziału.")
+            return
+        total = report.total
+        since, end = (t.tz_convert(data.TZ_LOCAL) for t in (total.cutoff, total.end))
+        st.caption(f"Okres testowy {since:%d.%m.%Y %H:%M} – {end:%d.%m.%Y %H:%M} (czas polski) · "
+                   f"{total.test_bars} H1 w trzech oknach. Przed pierwszym oknem dostępne było {total.preparation_bars} H1.")
+        st.caption("Pełny Doradca dodaje filtry wskaźników i wcześniejszych wyników. "
+                   "Obie opcje mają te same poziomy, reguły wejścia i wyjścia oraz maksymalnie jedną otwartą pozycję. "
+                   f"Limit {limit:g} godz. · koszt {cost:g} pkt · minimalny zysk do ryzyka {min_rr:g}:1.")
+
+        def comparison_rows(period: advisor.Validation) -> list[dict]:
+            return [{
+                "Wariant": label, "Zakończone pozycje": stats.count, "TP": stats.targets,
+                "SL": stats.stops, "Limit": stats.timeouts,
+                "Odsetek TP": f"{stats.targets / stats.count:.1%}" if stats.count >= advisor.MIN_HISTORY else "Za mało danych",
+                "Średni wynik po kosztach [pkt]": stats.mean_points,
+                "Łączny wynik po kosztach [pkt]": stats.mean_points * stats.count if stats.mean_points is not None else None,
+            } for label, stats in (("Odrzucenie H1", period.baseline), ("Pełny Doradca", period.advisor))]
+
+        columns = {name: st.column_config.NumberColumn(format="%.2f")
+                   for name in ("Średni wynik po kosztach [pkt]", "Łączny wynik po kosztach [pkt]")}
+        st.dataframe(pd.DataFrame(comparison_rows(total)), hide_index=True, alt="Łączne wyniki obu wariantów",
+                     column_config=columns)
+        rows = []
+        for window in report.windows:
+            first, last = (t.tz_convert(data.TZ_LOCAL) for t in (window.cutoff, window.end))
+            label = f"{first:%d.%m.%Y %H:%M} – {last:%d.%m.%Y %H:%M}"
+            rows.extend({"Okno testowe": label, **row} for row in comparison_rows(window))
+        st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Wyniki obu wariantów w kolejnych oknach",
+                     column_config=columns)
+        st.caption("Na początku każdego okna Doradca używa wyników już zakończonych pozycji. "
+                   "Pozycję zaliczamy do okna jej sygnału.")
+
+
+def render_advisor(
+    inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame], off: float, price: float,
+    rules_df: pd.DataFrame, context: list[tuple[str, float | None, float | None, bool]],
+) -> None:
+    settings = cfg["plan_ustawienia"]
+    cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+    now = pd.Timestamp.now(tz="UTC")
+    outcome = advisor.assess(frames, cost, min_rr, now, live=True)
+    proposal = outcome.proposal
+    if proposal is None:
+        st.info(outcome.reason, title="CZEKAJ")
+        if outcome.nearest:
+            level = outcome.nearest
+            st.caption(f"Najbliższy obserwowany poziom · {level.name} {_num(level.price + off, inst.decimals)}. "
+                       f"Odległość od ceny · {_num(abs(price - level.price - off), inst.decimals)}.")
+    else:
+        reason = outcome.reason
+        estimate = None
+        if not reason:
+            report = advisor_history(frames, cost, min_rr, limit, proposal.at)
+            estimate, sample = advisor.comparable(proposal, report)
+            reason = advisor.history_hold(estimate)
+        direction = proposal.level.direction.upper()
+        if reason:
+            st.info(reason, title=f"CZEKAJ · obserwowany kierunek {direction}")
+        else:
+            details = f"Świeca H1 odrzuciła poziom {_num(proposal.level.price + off, inst.decimals)}."
+            label = "Propozycja wstępna" if estimate is not None and estimate.count < advisor.MIN_HISTORY else "Propozycja"
+            st.success(details, title=f"{label} {direction} · {proposal.level.name}")
+        rr = f"{proposal.rr:.2f}:1" if proposal.rr is not None else "—"
+        at = proposal.at.tz_convert(data.TZ_LOCAL)
+        st.markdown(f"**H1 {at:%d.%m %H:%M} · Wejście {_num(proposal.entry + off, inst.decimals)} · "
+                    f"SL {_num(proposal.stop + off, inst.decimals)} · TP {_num(proposal.target + off, inst.decimals)} · "
+                    f"Zysk do ryzyka {rr} po kosztach**")
+        if proposal.additional_levels:
+            st.caption(f"Świeca odrzuciła także · {', '.join(proposal.additional_levels)}.")
+        labels = {-1: "Przeciw", 0: "Neutralne", 1: "Za"}
+        st.dataframe(pd.DataFrame([{"Warunek": detail, "Ocena": labels[vote]} for detail, vote in proposal.evidence]),
+                     hide_index=True, alt="Warunki wspierające propozycję i przemawiające przeciw")
+        if estimate is not None:
+            st.markdown(f"**{estimate.description()}**")
+            st.caption(f"Porównanie · {sample}. Limit {limit:g} godz. · koszt {cost:g} pkt na pozycję.")
+
+    alert_enabled = bool(cfg.get(advisor.ALERT_SETTING))
+    notify_advisor = st.checkbox("Powiadamiaj o nowych propozycjach doradcy", value=alert_enabled, key=f"advisor_alerts_{inst.key}")
+    if notify_advisor != alert_enabled:
+        cfg[advisor.ALERT_SETTING] = notify_advisor
+        storage.save_settings(cfg, inst.key)
+
+    market_context = st.expander("Kontekst rynku i własne reguły")
+    with market_context:
+        st.caption("Dodatkowy kontekst do własnej oceny. Porównanie historyczne korzysta z reguł automatycznych.")
+        quotes = [f"{label} {value:.2f}" for label, value, _, _ in context if value is not None]
+        if quotes:
+            st.caption(" · ".join(quotes))
+        if not rules_df.empty:
+            passed = rules_df[rules_df["Spełniona"]]
+            if not passed.empty:
+                st.write("Spełnione reguły użytkownika")
+                st.dataframe(passed[["Reguła", "Warunek"]], hide_index=True, alt="Spełnione reguły użytkownika")
+        closer = plan.nearest_levels([(str(x["nazwa"]), float(x["poziom"])) for x in cfg["poziomy"] if x.get("poziom")], price)
+        for level in closer:
+            if level:
+                st.caption(f"{level[0]} · {_num(level[1], inst.decimals)}")
+
+    history = st.expander("Wyniki historyczne doradcy", key=f"advisor_history_{inst.key}", on_change="rerun")
+    if history.open:
+        with history:
+            as_of = proposal.at if proposal else now.floor("h")
+            report = advisor_history(frames, cost, min_rr, limit, as_of)
+            rows = []
+            for (family, direction, groups), stats in sorted(report.items()):
+                if groups == 0:
+                    rows.append({"Źródło sygnału": family, "Kierunek": direction.upper(), "Przypadki": stats.count,
+                                 "TP przed SL i limitem": f"{stats.targets / stats.count:.1%}" if stats.count >= advisor.MIN_HISTORY else "Za mało danych",
+                                 "Średni wynik po kosztach [pkt]": stats.mean_points})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Wyniki historyczne według źródła sygnału i kierunku",
+                             column_config={"Średni wynik po kosztach [pkt]": st.column_config.NumberColumn(format="%.2f")})
+            else:
+                st.info("Brak zakończonych przypadków dla tych parametrów.")
+            st.caption("W teście wejście następuje na kolejnym otwarciu H1. Gdy świeca obejmie SL i TP, test liczy SL. "
+                       "Pozycje tej samej rodziny i kierunku są testowane bez nakładania się.")
+    render_advisor_validation(inst, cfg, frames)
+
+
+def render_archived(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame], bars: int) -> None:
+    st.subheader("Archiwum notowań")
+    h1 = frames["H1"]
+    end = data.bar_end("H1", h1.index[-1]).tz_convert(data.TZ_LOCAL)
+    st.warning(f"Ostatnia zapisana H1 zamknęła się {end:%d.%m.%Y o %H:%M} (czas polski). "
+               "Widok służy do wykresów i testów historycznych.", title="Dane z plików Parquet")
+    interval = st.segmented_control("Interwał wykresu archiwalnego", data.INTERVALS, default="H1",
+                                    key=f"archived_interval_{inst.key}") or "H1"
+    if not frames[interval].empty:
+        levels = [(str(x["nazwa"]), float(x["poziom"])) for x in cfg["poziomy"] if x.get("poziom")]
+        st.echarts_chart(build_chart(frames[interval], interval, bars, float(cfg["przesunięcie"]), levels, inst.name),
+                         height=640, alt=f"Archiwalny wykres {inst.name} {interval}")
+    render_advisor_validation(inst, cfg, frames)
+
+
 def render_harmonics(
     inst: Instrument, cfg: dict, off: float, price: float, h1: pd.DataFrame,
     patterns: list[harmonics.Projection], status: harmonics.Status | None,
@@ -837,6 +1004,8 @@ def render(inst: Instrument) -> None:
 
     with st.sidebar:
         st.header(f"Ustawienia: {inst.name}")
+        archive_only = st.checkbox("Czytaj zapisane świece", key=f"archive_only_{k}",
+                                   help="Pokaż wykres i test z lokalnego archiwum Parquet.")
         if f"off_{k}" not in st.session_state:
             st.session_state[f"off_{k}"] = float(cfg["przesunięcie"])
         manual_off = st.number_input(
@@ -854,7 +1023,7 @@ def render(inst: Instrument) -> None:
                 key=f"calib_price_{k}",
                 help="Przesunięcie zostanie wyliczone raz, w chwili kliknięcia, i zapisane razem z czasem obu cen.",
             )
-            st.form_submit_button("Kalibruj", icon=":material/tune:", width="stretch", on_click=_calibrate)
+            st.form_submit_button("Kalibruj", icon=":material/tune:", width="stretch", on_click=_calibrate, disabled=archive_only)
         msg = st.session_state.pop(f"calib_msg_{k}", None)
         if msg:
             kind, text = msg
@@ -868,10 +1037,21 @@ def render(inst: Instrument) -> None:
             get_intraday_chart.clear()
             get_quote.clear()
 
-    try:
-        frames = get_frames(inst.ticker)
-    except Exception as exc:  # brak sieci, limit Yahoo itp. - bez notowań nie ma czego pokazać
-        st.error(f"Nie udało się pobrać notowań {inst.ticker}: {exc}", title="Błąd pobierania")
+    if not archive_only:
+        try:
+            frames = get_frames(inst.ticker)
+        except Exception as exc:
+            st.warning(f"Nie udało się pobrać notowań {inst.ticker}: {exc}", title="Błąd pobierania")
+            archive_only = True
+    if archive_only:
+        try:
+            archived = engine.load_archived_frames(inst.ticker)
+        except FileNotFoundError:
+            st.info("Archiwum tego instrumentu powstanie po pierwszym udanym pobraniu świec D1 i H1.")
+        except (OSError, ValueError, KeyError, ImportError) as exc:
+            st.error(f"Nie udało się odczytać archiwum {inst.ticker}: {exc}", title="Błąd archiwum")
+        else:
+            render_archived(inst, cfg, archived, bars)
         st.stop()
 
     # Dane pomocnicze są opcjonalne - ich brak nie zatrzymuje wykresu ani reguł
@@ -976,12 +1156,14 @@ def render(inst: Instrument) -> None:
         )
 
     # ------------------------------------------------------------ zakładki
-    tab_plan, tab_simulation, tab_journal, tab_rules, tab_fib, tab_risk, tab_notify, tab_replay, tab_edit = st.tabs(
-        ["Plan pozycji", "Symulacja", "Dziennik", "Reguły", "Fibonacci", "Ryzyko pozycji", "Powiadomienia", "Historia alertów", "Ustawienia poziomów"]
+    tab_advisor, tab_plan, tab_simulation, tab_journal, tab_rules, tab_fib, tab_risk, tab_notify, tab_replay, tab_edit = st.tabs(
+        ["Doradca", "Plan pozycji", "Symulacja", "Dziennik", "Reguły", "Fibonacci", "Ryzyko pozycji", "Powiadomienia", "Historia alertów", "Ustawienia poziomów"]
     )
 
     with tab_plan:
         scenarios = render_plan_tab(inst, cfg, frames, off, price, levels, usdpln)
+    with tab_advisor:
+        render_advisor(inst, cfg, frames, off, price, rules_df, context)
     with tab_simulation:
         render_simulation(inst, cfg, scenarios, off)
     with tab_journal:

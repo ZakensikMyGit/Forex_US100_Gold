@@ -77,6 +77,10 @@ def _trade_metrics(direction: str, entry: float, sl: float, tp: float, cost_pts:
     return risk, reward, reward / risk if geometry_ok and risk > 0 else None, geometry_ok
 
 
+def reward_to_risk(direction: str, entry: float, sl: float, tp: float, cost_pts: float) -> float | None:
+    return _trade_metrics(direction, entry, sl, tp, cost_pts)[2]
+
+
 def _entry_checks(
     direction: str, entry: float, frames: dict[str, pd.DataFrame], h1_close: float | None,
     signal_time: pd.Timestamp | None, rr: float | None, min_rr: float, *, include_evidence: bool = False,
