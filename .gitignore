@@ -1,0 +1,6 @@
+/Finance_US100/Python/
+**/dane/
+/Aktualizacja_Finance_US100_powiadomienia/
+__pycache__/
+*.pyc
+.env

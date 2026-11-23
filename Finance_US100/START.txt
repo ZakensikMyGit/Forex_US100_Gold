@@ -1,0 +1,22 @@
+Finance US100 i zloto - pakiet przenosny x64
+
+1. Na komputerze z Windows 10/11 x64 rozpakuj caly ZIP. Zachowaj caly
+   folder Finance_US100 razem z folderami Python, dane, us100 i app_pages.
+   Mozesz uruchamiac go z pendrive'a lub skopiowac na dysk komputera.
+2. Otworz Uruchom_panel.cmd. Jesli przegladarka nie otworzy sie sama,
+   wpisz w niej http://localhost:8501.
+3. Jesli potrzebujesz alertow w tle, otworz Uruchom_monitor.cmd.
+   Zostaw jego okno otwarte. Notowania i Telegram wymagaja internetu.
+4. Telegram ustaw w panelu pod wykresem w zakladce Powiadomienia.
+   Podaj token w polu Token bota i chat_id swojego czatu, zapisz
+   konfiguracje i wyslij test. Token przechowywany w Menedzerze
+   poswiadczen Windows trzeba ustawic na tym komputerze.
+5. Dane uzytkownika sa w folderze dane. Zmiany dokonane na kopii
+   zapisuja sie tylko w tej kopii. Zamknij panel i monitor przed
+   odlaczeniem pendrive'a. Uruchamiaj monitor na jednym komputerze,
+   jesli chcesz dostawac jedna kopie kazdego alertu.
+
+ZIP zawiera biblioteki i Pythona 3.12 x64. Nie wymaga instalacji
+Pythona ani pobierania pakietow. Ustawienia, plany i dziennik transakcji
+sa przenoszone z istniejacych plikow ustawien. Historia powiadomien,
+kolejka i stan monitora sa tworzone od nowa.
