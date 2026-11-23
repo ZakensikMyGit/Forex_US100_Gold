@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from .data import bar_end
+from .data import bar_end, bars_between
 from .indicators import swing_points
 from .instruments import price_text
 from .signals import last_closed, rejects_level
@@ -107,7 +107,8 @@ def track(projection: Projection, h1: pd.DataFrame, now: pd.Timestamp) -> Status
     if last is None or last.name < projection.c.confirmed_at:
         return status
 
-    for bar in h1.loc[projection.c.confirmed_at:last.name, ["open", "high", "low", "close"]].itertuples():
+    window = bars_between(h1, projection.c.confirmed_at, last.name)
+    for bar in window[["open", "high", "low", "close"]].itertuples():
         closed_at = bar_end("H1", bar.Index)
         if (upward and bar.close < projection.c.price) or (not upward and bar.close > projection.c.price):
             return Status("invalid_c", closed_at, bar.close)

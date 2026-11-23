@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from . import harmonics, indicators, plan
-from .data import bar_end
+from .data import bar_end, bars_between
 from .signals import rejects_level, trend_series
 
 MIN_HISTORY = 30
@@ -148,7 +148,7 @@ class Market:
             patterns = patterns[-2:]
         for i, pattern in enumerate(patterns):
             horizon = patterns[i + 1].c.confirmed_at if i + 1 < len(patterns) else now
-            window = self.h1.loc[pattern.c.confirmed_at:horizon]
+            window = bars_between(self.h1, pattern.c.confirmed_at, horizon)
             reaction = harmonics.track(pattern, window, horizon)
             if reaction.stage == "rejected":
                 self.rejected_d[reaction.at] = Level(
@@ -252,7 +252,7 @@ def assess(frames: dict[str, pd.DataFrame], cost: float, min_rr: float,
     outcome = market.assess_bar(len(market.h1) - 1, cost, min_rr)
     proposal = outcome.proposal
     if live and proposal and not outcome.reason:
-        later = frames["H1"].loc[proposal.at:now]
+        later = bars_between(frames["H1"], proposal.at, now)
         if not later.empty:
             sign = 1 if proposal.level.direction == "long" else -1
             stop_hit = (later["low"] <= proposal.stop).any() if sign > 0 else (later["high"] >= proposal.stop).any()

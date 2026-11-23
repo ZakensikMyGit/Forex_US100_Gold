@@ -100,6 +100,13 @@ def bar_closed(interval: str, bar_start: Any, now: Any = None) -> bool:
     return now >= bar_end(interval, bar_start).to_pydatetime()
 
 
+def bars_between(frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Wybiera świece według czasu otwarcia, włącznie z granicami, z posortowanego indeksu."""
+    first = frame.index.searchsorted(start, side="left")
+    after_last = frame.index.searchsorted(end, side="right")
+    return frame.iloc[first:after_last]
+
+
 def _wall(naive: Any, tz) -> pd.Timestamp:
     return naive.tz_localize(tz, ambiguous=False, nonexistent="shift_forward")
 
