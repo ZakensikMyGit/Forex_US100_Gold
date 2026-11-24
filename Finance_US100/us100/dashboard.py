@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from . import advisor, archive, backtest, chart_annotations, contracts, data, delivery, engine, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
-from .instruments import GOLD, Instrument
+from .instruments import ALL, GOLD, Instrument
 
 
 @st.cache_data(ttl=300, show_spinner="Pobieram notowania…")
@@ -825,6 +825,10 @@ def render_simulation(inst: Instrument, cfg: dict) -> None:
         )
         min_rr = st.number_input("Min. zysk/ryzyko", min_value=0.1, value=float(settings["min_rr"]), step=0.1, key=f"paper_rr_{k}")
         limit = st.number_input("Limit czasu [godz.]", min_value=1.0, value=float(settings["limit_h"]), step=1.0, key=f"paper_limit_{k}")
+    typical = ALL[k].typical_cost
+    if cost > 5 * typical:
+        st.warning(f"Koszt {cost:g} to ponad 5× typowy koszt w XTB (ok. {typical:g}: spread i poślizg). "
+                   "Tak duży koszt odrzuca prawie każdy sygnał Doradcy. Sprawdź, czy nie wpisano kwoty w PLN lub USD za lot.")
     updated = {**settings, "koszt_pkt": cost, "min_rr": min_rr, "limit_h": limit}
     if updated != settings or enabled != cfg["symulacja doradcy"]:
         cfg["symulacja doradcy"] = enabled
@@ -952,12 +956,20 @@ def render_advisor_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.
                 "Odsetek TP": f"{stats.targets / stats.count:.1%}" if stats.count >= advisor.MIN_HISTORY else "Za mało danych",
                 "Średni wynik po kosztach [pkt]": stats.mean_points,
                 "Łączny wynik po kosztach [pkt]": stats.mean_points * stats.count if stats.mean_points is not None else None,
-            } for label, stats in (("Odrzucenie H1", period.baseline), ("Pełny Doradca", period.advisor))]
+            } for label, stats in (("Odrzucenie H1", period.baseline), ("Pełny Doradca", period.advisor),
+                                   (f"Losowe wejścia (×{advisor.RANDOM_DRAWS})", period.random))
+              if stats is not None]
 
         columns = {name: st.column_config.NumberColumn(format="%.2f")
                    for name in ("Średni wynik po kosztach [pkt]", "Łączny wynik po kosztach [pkt]")}
         st.dataframe(pd.DataFrame(comparison_rows(total)), hide_index=True, alt="Łączne wyniki obu wariantów",
                      column_config=columns)
+        st.caption(f"Losowe wejścia: dla każdej pozycji wariantu „Odrzucenie H1” {advisor.RANDOM_DRAWS} razy losujemy "
+                   "godzinę wejścia z tego samego okna i kierunek, z tymi samymi odległościami SL i TP oraz kosztem. "
+                   "Reguła, która nie bije tego wyniku, nie ma przewagi nad przypadkiem.")
+        for label, stats in (("Odrzucenie H1", total.baseline), ("Pełny Doradca", total.advisor)):
+            kind, text = advisor.against_chance(label, stats, total.random)
+            {"success": st.success, "info": st.info, "warning": st.warning}[kind](text)
         rows = []
         for window in report.windows:
             first, last = (t.tz_convert(data.TZ_LOCAL) for t in (window.cutoff, window.end))
