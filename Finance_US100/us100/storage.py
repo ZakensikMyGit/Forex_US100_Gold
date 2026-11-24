@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import copy
 import json
+from math import isfinite
 from pathlib import Path
+
+from .delivery import write_json
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "dane"
 
@@ -99,7 +102,8 @@ for _d in DEFAULTS.values():
     _d.setdefault("plany", [])  # otwarte i zamknięte plany pozycji
     _d.setdefault("obserwacje wejścia", {})  # po jednej dla long i short
     _d.setdefault("powiadomienia AB=CD", False)
-    _d.setdefault("powiadomienia doradcy", False)
+    _d.setdefault("powiadomienia doradcy", True)
+    _d.setdefault("symulacja doradcy", True)
     _d.setdefault("symulacja", {})  # parametry automatycznych pozycji wirtualnych
     _d.setdefault("plan_ustawienia", {"koszt_pkt": 0.0, "min_rr": 1.5, "wolumen": 0.01, "limit_h": 24.0})
 
@@ -112,7 +116,7 @@ def _num(v) -> float | None:
         x = float(v)
     except (TypeError, ValueError):
         return None
-    return x if x == x else None  # NaN -> None
+    return x if isfinite(x) else None
 
 
 def validate(tables: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], list[str]]:
@@ -181,16 +185,21 @@ def load_settings(key: str = "US100") -> dict:
     if path.exists():
         try:
             saved = json.loads(path.read_text(encoding="utf-8"))
-            data.update({k: v for k, v in saved.items() if k in defaults})
+            if isinstance(saved, dict):
+                data.update({k: v for k, v in saved.items() if k in defaults})
         except (OSError, json.JSONDecodeError):
             pass
+    plan = defaults["plan_ustawienia"].copy()
+    saved_plan = data["plan_ustawienia"]
+    if isinstance(saved_plan, dict):
+        for key in plan:
+            value = _num(saved_plan.get(key))
+            if value is not None and (value > 0 or (key == "koszt_pkt" and value == 0)):
+                plan[key] = value
+    data["plan_ustawienia"] = plan
     return data
 
 
 def save_settings(data: dict, key: str = "US100") -> None:
     """Zapis atomowy: monitor nigdy nie odczyta w połowie zapisanego pliku."""
-    path = settings_path(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_json(settings_path(key), data)

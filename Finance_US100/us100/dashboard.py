@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from http.client import HTTPException
+
 import pandas as pd
 import streamlit as st
 
-from . import advisor, backtest, data, delivery, engine, harmonics, indicators as ind, journal, notify, paper, plan, risk, signals, storage
-from .instruments import Instrument
+from . import advisor, archive, backtest, chart_annotations, contracts, data, delivery, engine, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
+from .instruments import GOLD, Instrument
 
 
 @st.cache_data(ttl=300, show_spinner="Pobieram notowania…")
@@ -16,7 +19,10 @@ def get_frames(ticker: str) -> dict[str, pd.DataFrame]:
 
 @st.cache_data(ttl=300, show_spinner="Pobieram świece do wykresu…")
 def get_intraday_chart(ticker: str, interval: str) -> pd.DataFrame:
-    return ind.add_indicators(data.load_intraday(ticker, interval))
+    observed = pd.Timestamp.now(tz="UTC")
+    frame = ind.add_indicators(data.load_intraday(ticker, interval))
+    frame.attrs["pobrano"] = observed
+    return frame
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -24,8 +30,66 @@ def get_quote(ticker: str) -> tuple[float, float]:
     return data.last_value(ticker)
 
 
+@st.cache_data(max_entries=8, show_spinner=False)
+def get_monitor_frames(ticker: str, snapshot: dict) -> dict[str, pd.DataFrame]:
+    return engine.load_monitor_frames(ticker, snapshot)
+
+
 def _num(x: float, dec: int = 0) -> str:
     return f"{x:,.{dec}f}".replace(",", " ")
+
+
+@st.cache_data(ttl=gold_spot.REFRESH_SECONDS, show_spinner=False)
+def get_gold_spot() -> tuple[float, datetime]:
+    return gold_spot.load_quote()
+
+
+@st.fragment(run_every=gold_spot.REFRESH_SECONDS)
+def render_gold_spot() -> None:
+    try:
+        price, updated = get_gold_spot()
+    except (OSError, HTTPException, ValueError, TypeError, KeyError):
+        st.info("Cena z Gold API jest chwilowo niedostępna.")
+    else:
+        age = pd.Timestamp.now(tz="UTC") - updated
+        stale = not pd.Timedelta(0) <= age <= gold_spot.MAX_AGE
+        local_updated = pd.Timestamp(updated).tz_convert(data.TZ_LOCAL)
+        st.metric("Złoto spot XAU/USD", f"{_num(price, 2)} USD/oz")
+        st.caption(f"Gold API · aktualizacja {local_updated:%d.%m.%Y %H:%M:%S} (czas polski)")
+        if stale:
+            st.warning("Cena spot jest nieaktualna. Porównanie będzie dostępne po odświeżeniu.")
+        with st.form("gold_spot_comparison"):
+            bid = st.number_input(
+                "Aktualna cena GOLD BID z xStation (USD/oz)", min_value=0.01,
+                value=None, step=0.01, format="%.2f", key="gold_spot_bid",
+                help="Wpisz bieżącą cenę sprzedaży z xStation i od razu zapisz pomiar.",
+            )
+            submitted = st.form_submit_button("Zapisz porównanie", disabled=stale)
+        if submitted:
+            try:
+                gold_spot.save_comparison(bid or 0.0, price, updated, pd.Timestamp.now(tz="UTC").to_pydatetime())
+            except ValueError as exc:
+                st.warning(str(exc))
+            except OSError:
+                st.error("Nie udało się zapisać porównania na dysku.")
+            else:
+                st.success("Zapisano porównanie.")
+
+    rows = gold_spot.load_comparisons()
+    if rows:
+        history = pd.DataFrame(reversed(rows))
+        history["Różnica BID − spot"] = history["xstation_bid"] - history["spot"]
+        for column in ("pomiar", "aktualizacja_spot"):
+            history[column] = pd.to_datetime(history[column], utc=True).dt.tz_convert(data.TZ_LOCAL).dt.strftime("%d.%m.%Y %H:%M:%S")
+        history = history.rename(columns={
+            "pomiar": "Czas pomiaru", "aktualizacja_spot": "Aktualizacja spot",
+            "xstation_bid": "BID xStation", "spot": "XAU/USD spot",
+        })
+        st.caption("Historia porównań · ceny i różnice w USD/oz · czas polski")
+        st.dataframe(history, hide_index=True, alt="Porównania cen złota spot i GOLD BID z xStation", column_config={
+            column: st.column_config.NumberColumn(format="%.2f")
+            for column in ("BID xStation", "XAU/USD spot", "Różnica BID − spot")
+        })
 
 
 def _table(rows: list[dict], kind: str) -> pd.DataFrame:
@@ -34,55 +98,73 @@ def _table(rows: list[dict], kind: str) -> pd.DataFrame:
 
 
 def build_chart(
-    df: pd.DataFrame, interval: str, n: int, off: float, levels: list[tuple[str, float]], name: str,
-    abcd: harmonics.Projection | None = None,
+    df: pd.DataFrame, interval: str, n: int, off: float, name: str, annotations: dict, extent: list[float],
+    entry: dict | None = None, *, show_volume: bool = True,
 ) -> dict:
     view = df.iloc[-n:].copy()
-    for col in ("open", "high", "low", "close", "ema9", "ema26", "ema50", "ema200", "bb_up", "bb_low"):
+    for col in ("open", "high", "low", "close"):
         view[col] = view[col] + off
     fmt = "%Y-%m-%d" if interval == "D1" else "%m-%d %H:%M"
     view["czas"] = [t.strftime(fmt) for t in view.index]
-    view["hist_plus"] = view["macd_hist"].where(view["macd_hist"] >= 0)
-    view["hist_minus"] = view["macd_hist"].where(view["macd_hist"] < 0)
-    src = view[
-        ["czas", "open", "close", "low", "high", "ema9", "ema26", "ema50", "ema200", "bb_up", "bb_low",
-         "rsi", "macd", "macd_signal", "hist_plus", "hist_minus"]
-    ].round(2).reset_index(drop=True)
+    columns = ["czas", "open", "close", "low", "high"]
+    volume = show_volume and "volume" in view and bool(view["volume"].gt(0).any())
+    volume_groups = []
+    if volume:
+        position = ind.close_position(view)
+        quartile = ind.CLOSE_QUARTILE
+        top = position.ge(1 - quartile)
+        bottom = position.le(quartile)
+        volume_groups = [
+            ("Zamknięcie wysoko", "#26a69a", top),
+            ("Zamknięcie nisko", "#ef5350", bottom),
+            ("Zamknięcie pośrodku", "#6888bb", ~(top | bottom)),
+        ]
+        for label, _, condition in volume_groups:
+            view[label] = view["volume"].where(condition)
+            columns.append(label)
+    src = view[columns].round(2).reset_index(drop=True)
+    src.attrs.clear()
 
     lo, hi = float(view["low"].min()), float(view["high"].max())
-    pad = (hi - lo) * 0.05
-    marks = [{"name": nm, "yAxis": lvl} for nm, lvl in levels if lo - pad <= lvl <= hi + pad]
-    pivots = []
-    if abcd is not None and interval == "H4":
-        pivots = [{"name": label, "coord": [point.time.strftime(fmt), point.price + off]}
-                  for label, point in zip("ABC", (abcd.a, abcd.b, abcd.c)) if point.time in view.index]
+    price_range = {}
+    if extent:
+        bottom, top = min(lo, *extent), max(hi, *extent)
+        pad = max((top - bottom) * 0.035, 0.01)
+        price_range = {"min": bottom - pad, "max": top + pad}
+    entry_series = []
+    if entry is not None:
+        index, price = entry["value"]
+        point = {**entry, "value": [src["czas"].iat[index], price]}
+        entry_series.append({
+            "id": chart_annotations.ENTRY_SERIES_ID, "name": "Wejście Doradcy", "type": "scatter",
+            "data": [point], "encode": {"x": 0, "y": 1}, "selectedMode": "single", "z": 10,
+            "symbol": "arrow", "symbolSize": 24,
+            "tooltip": {"trigger": "item", "formatter": "{b}"},
+            "select": {"itemStyle": {"borderWidth": 2, "borderColor": "#f4bc43"}},
+        })
 
-    def line(col: str, label: str, color: str, axis: int = 0, dashed: bool = False) -> dict:
-        return {
-            "type": "line", "name": label, "encode": {"x": "czas", "y": col},
-            "xAxisIndex": axis, "yAxisIndex": axis, "showSymbol": False,
-            "lineStyle": {"width": 1.2, "color": color, "type": "dashed" if dashed else "solid"},
-            "itemStyle": {"color": color},
-        }
-
-    axes = [0, 1, 2]
+    grids = [{"left": 42, "right": 70, "top": 28, "bottom": "26%" if volume else 50}]
+    y_axes = [{"scale": True, "gridIndex": 0, "position": "right",
+               "splitLine": {"lineStyle": {"opacity": 0.3}}, **price_range}]
+    volume_series = []
+    if volume:
+        grids.append({"left": 42, "right": 70, "top": "79%", "bottom": 48})
+        y_axes.append({"gridIndex": 1, "min": 0, "position": "right", "splitNumber": 2,
+                       "name": "Wolumen", "splitLine": {"show": False}})
+        volume_series = [{
+            "type": "bar", "name": label, "stack": "wolumen",
+            "encode": {"x": "czas", "y": label, "tooltip": [label]},
+            "xAxisIndex": 1, "yAxisIndex": 1, "itemStyle": {"color": color},
+        } for label, color, _ in volume_groups]
+    axes = list(range(len(grids)))
     return {
         "animation": False,
-        "legend": {"top": 0, "data": ["EMA 9", "EMA 26", "EMA 50", "EMA 200", "Bollinger"]},
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
         "axisPointer": {"link": [{"xAxisIndex": "all"}]},
         "dataset": {"source": src},
-        "grid": [
-            {"left": 60, "right": 70, "top": 30, "height": "52%"},
-            {"left": 60, "right": 70, "top": "64%", "height": "13%"},
-            {"left": 60, "right": 70, "top": "81%", "height": "13%"},
-        ],
-        "xAxis": [{"type": "category", "gridIndex": g, "axisLabel": {"show": g == 2}, "boundaryGap": True} for g in axes],
-        "yAxis": [
-            {"scale": True, "gridIndex": 0, "position": "right", "splitLine": {"lineStyle": {"opacity": 0.3}}},
-            {"gridIndex": 1, "min": 0, "max": 100, "position": "right", "splitNumber": 2, "name": "RSI"},
-            {"gridIndex": 2, "scale": True, "position": "right", "splitNumber": 2, "name": "MACD"},
-        ],
+        "grid": grids,
+        "xAxis": [{"type": "category", "gridIndex": g, "axisLabel": {"show": g == axes[-1]}, "boundaryGap": True} for g in axes],
+        "yAxis": y_axes,
         "dataZoom": [
             {"type": "inside", "xAxisIndex": axes, "start": 0, "end": 100},
             {"type": "slider", "xAxisIndex": axes, "bottom": 0, "height": 18},
@@ -92,36 +174,116 @@ def build_chart(
                 "type": "candlestick", "name": name,
                 "encode": {"x": "czas", "y": ["open", "close", "low", "high"]},
                 "itemStyle": {"color": "#26a69a", "color0": "#ef5350", "borderColor": "#26a69a", "borderColor0": "#ef5350"},
-                "markLine": {
-                    "symbol": "none",
-                    "data": marks,
-                    "label": {"formatter": "{b}: {c}", "position": "insideStartTop", "fontSize": 10},
-                    "lineStyle": {"color": "#7e57c2", "type": "dashed", "width": 1},
-                },
-                "markPoint": {"data": pivots, "symbol": "circle", "symbolSize": 20,
-                              "itemStyle": {"color": "#7e57c2"}, "label": {"formatter": "{b}", "color": "#fff"}},
+                **annotations,
             },
-            line("ema9", "EMA 9", "#2962ff"),
-            line("ema26", "EMA 26", "#ff9800"),
-            line("ema50", "EMA 50", "#43a047"),
-            line("ema200", "EMA 200", "#e53935"),
-            line("bb_up", "Bollinger", "#9e9e9e", dashed=True),
-            line("bb_low", "Bollinger", "#9e9e9e", dashed=True),
-            {
-                **line("rsi", "RSI", "#7e57c2", axis=1),
-                "markLine": {
-                    "symbol": "none", "silent": True,
-                    "data": [{"yAxis": 30}, {"yAxis": 70}],
-                    "lineStyle": {"color": "#9e9e9e", "type": "dashed"},
-                    "label": {"show": False},
-                },
-            },
-            line("macd", "MACD", "#2962ff", axis=2),
-            line("macd_signal", "Sygnał", "#ff9800", axis=2),
-            {"type": "bar", "name": "Histogram +", "encode": {"x": "czas", "y": "hist_plus"}, "xAxisIndex": 2, "yAxisIndex": 2, "itemStyle": {"color": "#26a69a"}},
-            {"type": "bar", "name": "Histogram −", "encode": {"x": "czas", "y": "hist_minus"}, "xAxisIndex": 2, "yAxisIndex": 2, "itemStyle": {"color": "#ef5350"}},
+            *volume_series,
+            *entry_series,
         ],
     }
+
+
+def render_market_chart(
+    inst: Instrument, chart_frame: pd.DataFrame, interval: str, bars: int, off: float,
+    levels: list[tuple[str, float]], frames: dict[str, pd.DataFrame], now: pd.Timestamp,
+    proposal: advisor.Proposal | None, *, archived: bool = False,
+) -> None:
+    chart, legend = st.columns([5, 1], gap="medium")
+    use = "archived" if archived else "live"
+    with legend:
+        legend_box = st.container(border=True)
+    with legend_box:
+        details = st.container()
+        with st.expander("Warstwy wykresu"):
+            layers = {
+                layer for layer, label in chart_annotations.LAYERS.items()
+                if st.checkbox(label, value=layer in chart_annotations.DEFAULT_LAYERS,
+                               key=f"chart_{use}_{inst.key}_{layer}")
+            }
+    chart_key = f"market_chart_{use}_{inst.key}"
+    selected = False
+    if "entry" in layers and proposal is not None:
+        chart_key += f"_{int(proposal.at.timestamp())}_{proposal.level.direction}"
+        state = st.session_state.get(chart_key, {})
+        selected = any(
+            point["series_id"] == chart_annotations.ENTRY_SERIES_ID and 0 in point["data_indices"]
+            for point in state.get("selection", {}).get("selected", [])
+        )
+    view = chart_frame.iloc[-bars:]
+    patterns = chart_annotations.recent_patterns(chart_frame, interval, now, lookback=bars) if "harmonics" in layers else []
+    context = chart_frame.tail(bars + 60)
+    pof = price_structures.last_wave(context, interval, now) if "pof" in layers else None
+    zones = tuple(price_structures.polarity_zones(context, interval, now)) if "zzb" in layers else ()
+    annotations, extent, entry = chart_annotations.build(
+        view, interval, off, layers, levels, frames, now, patterns, proposal, show_exit_levels=selected,
+        pof=pof, zones=zones,
+    )
+    with details:
+        if "entry" in layers:
+            st.markdown("**Doradca · H1**")
+            if proposal is not None:
+                label = "Archiwalny sygnał" if archived else "Propozycja"
+                st.caption(
+                    f"{label} **{proposal.level.direction.upper()}** · {_num(proposal.entry + off, inst.decimals)}"
+                )
+                if entry is None:
+                    st.caption("Sygnał poza zakresem wykresu.")
+                elif selected:
+                    st.caption(f"SL {_num(proposal.stop + off, inst.decimals)} · TP {_num(proposal.target + off, inst.decimals)}")
+                else:
+                    st.caption("Kliknij strzałkę, aby pokazać SL i TP.")
+            else:
+                st.markdown("**CZEKAJ**")
+                st.caption("Brak potwierdzonego wejścia.")
+        if "harmonics" in layers:
+            st.markdown(f"**Układ AB=CD · {interval}**")
+            if patterns:
+                projection, status = patterns[-1]
+                states = {"building": "W budowie", "reached": "Cena dotarła do strefy D",
+                          "rejected": "Reakcja w strefie D", "invalid_c": "Układ zanegowany", "invalid_d": "Układ zanegowany"}
+                st.caption(states[status.stage])
+                if status.stage in ("building", "reached"):
+                    low, high = projection.zone
+                    direction = projection.reaction_direction
+                    move = "w górę" if direction == "long" else "w dół"
+                    st.caption(f"Strefa D {_num(low + off, inst.decimals)}–{_num(high + off, inst.decimals)}. "
+                               f"Odbicie {move} może wskazać {direction.upper()}.")
+                if status.stage == "rejected":
+                    st.caption(f"Wykryta reakcja {projection.reaction_direction.upper()}.")
+            else:
+                st.caption("Brak układu w ostatnich świecach.")
+        if "pof" in layers:
+            st.markdown(f"**POF · {interval}**")
+            if pof is None:
+                st.caption("Czekam na potwierdzenie ostatniej fali.")
+            else:
+                levels_by_ratio = dict(pof.levels())
+                st.caption(f"50% · {_num(levels_by_ratio[0.5] + off, inst.decimals)}  "
+                           f"\n61,8% · {_num(levels_by_ratio[0.618] + off, inst.decimals)}")
+        if "zzb" in layers:
+            st.markdown(f"**ZZB · {interval}**")
+            if not zones:
+                st.caption("Brak aktywnej zmiany roli poziomu.")
+            for zone in zones:
+                low, high = zone.bounds
+                status = "Po reteście" if zone.retested_at is not None else "Czeka na retest"
+                st.caption(f"{zone.role} {_num(low + off, inst.decimals)}–{_num(high + off, inst.decimals)} · {status}")
+                if pof is not None:
+                    matches = [f"{ratio * 100:g}%".replace(".", ",") for ratio, price in pof.levels() if low <= price <= high]
+                    if matches:
+                        st.caption(f"W tej strefie wypada POF {', '.join(matches)}.")
+        if "volume" in layers:
+            if "volume" in view and view["volume"].gt(0).any():
+                st.caption(f"Wolumen {inst.ticker} · Yahoo Finance. Zielony i czerwony oznaczają zamknięcie "
+                           "w górnej lub dolnej ćwiartce świecy. To przybliżenie kierunku presji cenowej.")
+            else:
+                st.caption(f"Brak wolumenu dla {interval} w pobranych danych.")
+    with chart:
+        st.echarts_chart(
+            build_chart(chart_frame, interval, bars, off, inst.name, annotations, extent, entry,
+                        show_volume="volume" in layers),
+            height=620, alt=f"Świece {inst.name} {interval}, wolumen i oznaczenia sygnałów",
+            key=chart_key, on_select="rerun" if entry is not None else "ignore",
+        )
 
 
 @st.cache_data(ttl=3600, show_spinner="Sprawdzam podobne sygnały w historii…", max_entries=64)
@@ -203,7 +365,7 @@ def render_journal_tab(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFra
     )
     df = journal.entries(cfg["plany"], frames["H1"], off, usd_pp, usdpln)
     if df.empty:
-        st.info("Dziennik jest pusty. Zamknij plan w zakładce „Plan pozycji” albo dodaj transakcję spoza planu poniżej.", icon=":material/menu_book:")
+        st.info("Dziennik jest pusty. Dodaj transakcję poniżej.", icon=":material/menu_book:")
     else:
         s = journal.summary(df)
         broker_rate = s["xStation: skuteczność"]
@@ -438,7 +600,7 @@ def render_rejection_history(inst: Instrument, frames: dict[str, pd.DataFrame], 
 def render_plan_tab(
     inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame], off: float, price: float,
     levels: list[tuple[str, float]], usdpln: float | None,
-) -> dict[str, tuple[float, float, float]]:
+) -> None:
     k, dec = inst.key, inst.decimals
     step = 0.1 if dec > 1 else 1.0
     ps = cfg["plan_ustawienia"]
@@ -450,10 +612,8 @@ def render_plan_tab(
 
     with st.container(horizontal=True, vertical_alignment="bottom"):
         vol = st.number_input("Wolumen [lot]", min_value=0.001, value=float(ps["wolumen"]), step=0.001, format="%.3f", key=f"pl_vol_{k}")
-        cost = st.number_input("Koszty [pkt]", min_value=0.0, value=float(ps["koszt_pkt"]), step=step, key=f"pl_cost_{k}", help="Spread i inne koszty w punktach, odejmowane od zysku i doliczane do ryzyka.")
-        min_rr = st.number_input("Min. zysk/ryzyko", min_value=0.1, value=float(ps["min_rr"]), step=0.1, key=f"pl_rr_{k}")
-        limit_h = st.number_input("Limit czasu [godz.]", min_value=1.0, value=float(ps["limit_h"]), step=1.0, key=f"pl_lim_{k}")
-    new_ps = {"wolumen": vol, "koszt_pkt": cost, "min_rr": min_rr, "limit_h": limit_h}
+    cost, min_rr, limit_h = (float(ps[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+    new_ps = {**ps, "wolumen": vol}
     if new_ps != ps:
         cfg["plan_ustawienia"] = new_ps
         storage.save_settings(cfg, k)
@@ -518,7 +678,6 @@ def render_plan_tab(
             )
 
     render_entry_watches(inst, cfg, scen, vol, limit_h, cost, min_rr, frames, off)
-    render_rejection_history(inst, frames, limit_h, cost)
 
     # -------------------------------------------------------- ten plan na historii
     st.markdown("#### Sprawdź ten plan na historii")
@@ -639,12 +798,9 @@ def render_plan_tab(
     n_closed = sum(1 for p in cfg["plany"] if p.get("status") == "zamknięty")
     if n_closed:
         st.caption(f"Zamknięte transakcje ({n_closed}) są w zakładce „Dziennik”.")
-    return scen
 
 
-def render_simulation(
-    inst: Instrument, cfg: dict, scenarios: dict[str, tuple[float, float, float]], off: float,
-) -> None:
+def render_simulation(inst: Instrument, cfg: dict) -> None:
     k = inst.key
     active = cfg["symulacja"]
     settings = cfg["plan_ustawienia"]
@@ -653,48 +809,53 @@ def render_simulation(
     st.button("Odśwież symulację", key=f"paper_refresh_{k}")
     state = paper.load(k)
     st.caption(
-        "Monitor otwiera wirtualne pozycje na zamknięciu H1 według warunków z „Planu pozycji”. "
-        "Nowe wejście wymaga ponownego spełnienia warunków po świecy, na której nie były spełnione. "
-        "SL, TP i limit rozliczane są na podstawie kolejnych świec H1. Pozycje i wyniki są wyłącznie wirtualne."
+        "Po sygnale Doradcy monitor symuluje wejście po ostatniej dostępnej cenie w następnej H1. "
+        "SL, TP i limit rozlicza na świecach H1 rozpoczynających się po wejściu. "
+        "Monitor musi działać w tle."
     )
     st.caption(f"Stały wolumen nowych pozycji w symulacji: {volume:.3f} lota.")
-    for direction, col in zip(plan.DIRECTIONS, st.columns(2)):
-        with col, st.container(border=True):
-            st.markdown(f"**{direction.capitalize()}**")
-            saved = active.get(direction)
-            entry, sl, tp = (saved["próg"], saved["sl"], saved["tp"]) if saved else scenarios[direction]
-            st.caption(f"Próg {_num(entry, inst.decimals)} · SL {_num(sl, inst.decimals)} · TP {_num(tp, inst.decimals)}")
-            if saved:
-                st.caption(f"Aktywna · limit {saved['limit godzin']:g} godz. · koszty {saved['koszt pkt']:g} pkt")
-                if st.button("Wstrzymaj nowe wejścia", key=f"paper_pause_{k}_{direction}"):
-                    del active[direction]
-                    storage.save_settings(cfg, k)
-                    st.rerun()
-            else:
-                if st.button("Włącz z Planu pozycji", key=f"paper_enable_{k}_{direction}"):
-                    errors = plan.validate_plan(direction, entry, sl, tp, volume, settings["limit_h"])
-                    if errors:
-                        st.error("Popraw wartości w „Planie pozycji”. " + ", ".join(errors))
-                    else:
-                        active[direction] = paper.new_scenario(k, entry, sl, tp, settings, off)
-                        storage.save_settings(cfg, k)
-                        st.rerun()
+    enabled = st.checkbox("Symuluj propozycje Doradcy", value=bool(cfg["symulacja doradcy"]), key=f"paper_advisor_{k}")
+    unit = "USD/oz ceny złota" if k == GOLD.key else "pkt indeksu US100"
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        cost = st.number_input(
+            f"Koszt wejścia i wyjścia [{unit}]", min_value=0.0, value=float(settings["koszt_pkt"]),
+            step=0.1, key=f"paper_cost_{k}",
+            help="Łączny koszt transakcji przeliczony na ruch ceny instrumentu. "
+                 "Ta wartość pomniejsza zysk i zwiększa ryzyko przy ocenie każdego sygnału Doradcy.",
+        )
+        min_rr = st.number_input("Min. zysk/ryzyko", min_value=0.1, value=float(settings["min_rr"]), step=0.1, key=f"paper_rr_{k}")
+        limit = st.number_input("Limit czasu [godz.]", min_value=1.0, value=float(settings["limit_h"]), step=1.0, key=f"paper_limit_{k}")
+    updated = {**settings, "koszt_pkt": cost, "min_rr": min_rr, "limit_h": limit}
+    if updated != settings or enabled != cfg["symulacja doradcy"]:
+        cfg["symulacja doradcy"] = enabled
+        cfg["plan_ustawienia"] = updated
+        storage.save_settings(cfg, k)
+        st.rerun()
+    for direction in tuple(active):
+        if st.button(f"Wstrzymaj zapisany scenariusz {direction.upper()}", key=f"paper_pause_{k}_{direction}"):
+            del active[direction]
+            storage.save_settings(cfg, k)
+            st.rerun()
 
+    if decision := notify.load_state(k).get("ocena doradcy"):
+        close = decision.get("świeca")
+        label = f"H1 {pd.Timestamp(close).tz_convert(data.TZ_LOCAL):%d.%m %H:%M}" if close else "ostatni cykl"
+        st.caption(f"Ocena monitora · {label} · {decision['powód']}")
     if last := state.get("sprawdzono"):
         stamp = pd.Timestamp(last).tz_convert(data.TZ_LOCAL)
         st.caption(f"Ostatnia przetworzona świeca zakończyła się {stamp:%d.%m.%Y o %H:%M} (czas polski).")
-    elif active:
-        st.info("Oczekiwanie na pierwszą zamkniętą świecę H1 po włączeniu. Monitor musi działać w tle.")
+    elif (enabled or active) and not decision:
+        st.info("Oczekiwanie na pierwszą propozycję spełniającą warunki wejścia.")
 
     positions = paper.positions(state)
     opened = positions[positions["status"].eq("otwarta")] if not positions.empty else positions
     if not opened.empty:
         st.markdown("#### Otwarte pozycje wirtualne")
-        columns = ["kierunek", "otwarto", "cena wejścia", "wolumen", "sl początkowy", "sl", "tp",
+        columns = ["źródło", "kierunek", "otwarto", "cena wejścia", "wolumen", "sl początkowy", "sl", "tp",
                    "zmiany SL", "wynik otwarty pkt", "maks. wynik pkt", "limit godzin", "description"]
         st.dataframe(opened.reindex(columns=columns),
                      hide_index=True, alt="Otwarte pozycje wirtualne i ich poziomy wyjścia")
-        st.caption("Wstrzymanie nowych wejść pozostawia otwarte pozycje pod opieką monitora.")
+        st.caption("Po wstrzymaniu nowych wejść monitor nadal śledzi otwarte pozycje.")
 
     closed = positions[positions["status"].eq("zamknięta")] if not positions.empty else positions
     st.markdown("#### Zamknięte pozycje wirtualne")
@@ -705,7 +866,7 @@ def render_simulation(
             st.metric("Pozycje", len(closed))
             st.metric("Dodatni wynik", f"{(closed['wynik pkt'] > 0).mean():.0%}")
             st.metric("Suma po kosztach", f"{closed['wynik pkt'].sum():+.2f} pkt")
-        columns = ["kierunek", "otwarto", "zamknięto", "cena wejścia", "cena wyjścia", "wolumen", "sl początkowy", "sl", "tp",
+        columns = ["źródło", "kierunek", "otwarto", "zamknięto", "cena wejścia", "cena wyjścia", "wolumen", "sl początkowy", "sl", "tp",
                    "zmiany SL", "powód", "wynik pkt", "wynik R", "godziny", "description"]
         st.dataframe(closed.iloc[::-1].reindex(columns=columns), hide_index=True, alt="Historia zamkniętych pozycji wirtualnych")
     if not positions.empty:
@@ -780,7 +941,7 @@ def render_advisor_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.
         since, end = (t.tz_convert(data.TZ_LOCAL) for t in (total.cutoff, total.end))
         st.caption(f"Okres testowy {since:%d.%m.%Y %H:%M} – {end:%d.%m.%Y %H:%M} (czas polski) · "
                    f"{total.test_bars} H1 w trzech oknach. Przed pierwszym oknem dostępne było {total.preparation_bars} H1.")
-        st.caption("Pełny Doradca dodaje filtry wskaźników i wcześniejszych wyników. "
+        st.caption("Pełny Doradca dodaje filtry wskaźników, wolumenu i wcześniejszych wyników. "
                    "Obie opcje mają te same poziomy, reguły wejścia i wyjścia oraz maksymalnie jedną otwartą pozycję. "
                    f"Limit {limit:g} godz. · koszt {cost:g} pkt · minimalny zysk do ryzyka {min_rr:g}:1.")
 
@@ -808,14 +969,107 @@ def render_advisor_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.
                    "Pozycję zaliczamy do okna jej sygnału.")
 
 
+def assess_for_display(
+    frames: dict[str, pd.DataFrame], settings: dict, now: pd.Timestamp, *, live: bool,
+) -> tuple[advisor.Assessment, advisor.History | None, str]:
+    cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+    outcome = advisor.assess(frames, cost, min_rr, now, live=live)
+    if outcome.reason or outcome.proposal is None:
+        return outcome, None, ""
+    proposal = outcome.proposal
+    report = advisor_history(frames, cost, min_rr, limit, proposal.at)
+    estimate, sample = advisor.comparable(proposal, report)
+    return advisor.Assessment(advisor.history_hold(estimate), proposal), estimate, sample
+
+
+def monitor_view(inst: Instrument, fallback: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], dict]:
+    snapshot = delivery.read_json(notify.DATA_DIR / "monitor_status.json", {}).get("notowania", {}).get(inst.key, {})
+    if snapshot.get("H1"):
+        try:
+            return get_monitor_frames(inst.ticker, {"H1": snapshot["H1"]}), snapshot
+        except (OSError, ValueError, KeyError):
+            pass
+    return fallback, {}
+
+
+def monitor_assessment(
+    frames: dict[str, pd.DataFrame], settings: dict, snapshot: dict,
+) -> tuple[advisor.Assessment, advisor.History | None, str]:
+    now = pd.Timestamp.now(tz="UTC")
+    observed = pd.Timestamp(snapshot["H1"]["pobrano"]) if snapshot.get("H1") else frames["H1"].attrs.get("pobrano", now)
+    if now - observed > advisor.MAX_SIGNAL_AGE:
+        return advisor.Assessment("Dane są nieaktualne. Czekam na nowe pobranie."), None, ""
+    outcome, estimate, sample = assess_for_display(frames, settings, observed, live=True)
+    if outcome.proposal is not None and now - outcome.proposal.at > advisor.MAX_SIGNAL_AGE:
+        return advisor.Assessment("Sygnał wygasł. Czekam na nową świecę H1."), None, ""
+    return outcome, estimate, sample
+
+
+@st.fragment(run_every="45s")
+def render_live_market(
+    inst: Instrument, cfg: dict, bars: int, off: float, levels: list[tuple[str, float]],
+    fallback: dict[str, pd.DataFrame],
+) -> None:
+    frames, snapshot = monitor_view(inst, fallback)
+    st.subheader("Wykres")
+    interval = st.segmented_control("Interwał wykresu", ("M5", "M15", "H1", "H4", "D1"),
+                                    default="H1", key=f"interval_{inst.key}") or "H1"
+    frame = frames.get(interval)
+    short = interval in data.CHART_INTRADAY
+    if short:
+        try:
+            frame = engine.load_short_chart(inst.ticker, interval, snapshot) if snapshot else get_intraday_chart(inst.ticker, interval)
+        except (FileNotFoundError, ValueError) as exc:
+            st.info("Monitor przygotowuje archiwum M5." if snapshot else f"Brak świec {interval}: {exc}")
+            return
+        except Exception as exc:
+            st.warning(f"Nie udało się odczytać świec {interval}: {exc}")
+            return
+    if frame is None or frame.empty:
+        st.info(f"Brak świec {interval}.")
+        return
+
+    source = snapshot.get("M5" if short else "H1", {})
+    observed = frame.attrs.get("pobrano", pd.Timestamp.now(tz="UTC"))
+    if source:
+        observed = pd.Timestamp(source["pobrano"])
+    observed = observed.tz_convert(data.TZ_LOCAL)
+    price = float(frame["close"].iloc[-1]) + off
+    st.metric(inst.name, _num(price, inst.decimals))
+    last = signals.last_closed(frame, interval, observed)
+    stamps = []
+    if last is not None:
+        end = data.bar_end(interval, last.name).tz_convert(data.TZ_LOCAL)
+        stamps.append(f"Świeca {interval} zamknięta {end:%d.%m %H:%M}")
+    if source or "pobrano" in frame.attrs:
+        label = "Pobranie przez monitor" if source else "Pobranie przez panel"
+        stamps.append(f"{label} {observed:%d.%m %H:%M:%S}")
+    if stamps:
+        st.caption(" · ".join(stamps) + " (czas polski)")
+    outcome, _, _ = monitor_assessment(frames, cfg["plan_ustawienia"], snapshot)
+    render_market_chart(inst, frame, interval, bars, off, levels, frames, observed,
+                        outcome.proposal if not outcome.reason else None)
+
+
+@st.fragment(run_every="45s")
+def render_live_advisor(
+    inst: Instrument, cfg: dict, fallback: dict[str, pd.DataFrame], off: float,
+    context: list[tuple[str, float | None, float | None, bool]],
+) -> None:
+    frames, snapshot = monitor_view(inst, fallback)
+    outcome, estimate, sample = monitor_assessment(frames, cfg["plan_ustawienia"], snapshot)
+    price = float(frames["H1"]["close"].iloc[-1]) + off
+    rules_df = signals.evaluate_rules(cfg["reguły"], frames, off, now=frames["H1"].attrs.get("pobrano"))
+    render_advisor(inst, cfg, frames, off, price, rules_df, context, pd.Timestamp.now(tz="UTC"), outcome, estimate, sample)
+
+
 def render_advisor(
     inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame], off: float, price: float,
     rules_df: pd.DataFrame, context: list[tuple[str, float | None, float | None, bool]],
+    now: pd.Timestamp, outcome: advisor.Assessment, estimate: advisor.History | None, sample: str,
 ) -> None:
     settings = cfg["plan_ustawienia"]
     cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
-    now = pd.Timestamp.now(tz="UTC")
-    outcome = advisor.assess(frames, cost, min_rr, now, live=True)
     proposal = outcome.proposal
     if proposal is None:
         st.info(outcome.reason, title="CZEKAJ")
@@ -825,11 +1079,6 @@ def render_advisor(
                        f"Odległość od ceny · {_num(abs(price - level.price - off), inst.decimals)}.")
     else:
         reason = outcome.reason
-        estimate = None
-        if not reason:
-            report = advisor_history(frames, cost, min_rr, limit, proposal.at)
-            estimate, sample = advisor.comparable(proposal, report)
-            reason = advisor.history_hold(estimate)
         direction = proposal.level.direction.upper()
         if reason:
             st.info(reason, title=f"CZEKAJ · obserwowany kierunek {direction}")
@@ -891,7 +1140,43 @@ def render_advisor(
                 st.info("Brak zakończonych przypadków dla tych parametrów.")
             st.caption("W teście wejście następuje na kolejnym otwarciu H1. Gdy świeca obejmie SL i TP, test liczy SL. "
                        "Pozycje tej samej rodziny i kierunku są testowane bez nakładania się.")
-    render_advisor_validation(inst, cfg, frames)
+
+
+@st.cache_data(ttl=600, max_entries=8, show_spinner="Porównuję wejścia H1 i M5…")
+def timing_validation(
+    frames: dict[str, pd.DataFrame], m5: pd.DataFrame, cost: float, min_rr: float, limit: float, now: pd.Timestamp,
+) -> advisor.TimingComparison | None:
+    return advisor.compare_entry_timing(frames, m5, cost, min_rr, limit, now)
+
+
+def render_timing_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame]) -> None:
+    details = st.expander("Wejścia H1 i M5 na wspólnym okresie", key=f"timing_validation_{inst.key}", on_change="rerun")
+    if not details.open:
+        return
+    with details:
+        try:
+            m5 = engine.load_short_chart(inst.ticker, "M5")
+        except (OSError, ValueError):
+            st.info("Porównanie stanie się dostępne po zapisaniu świec M5 przez monitor.")
+            return
+        params = cfg["plan_ustawienia"]
+        cost, min_rr, limit = (float(params[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+        now = min(pd.Timestamp.now(tz="UTC"), data.bar_end("M5", m5.index[-1]))
+        report = timing_validation(frames, m5, cost, min_rr, limit, now)
+        if report is None:
+            st.info(f"Do porównania potrzeba co najmniej {advisor.MIN_VALIDATION_BARS} zamkniętych H1 we wspólnym okresie.")
+            return
+        first = report.start.tz_convert(data.TZ_LOCAL)
+        last = report.end.tz_convert(data.TZ_LOCAL)
+        st.caption(f"Okres testowy {first:%d.%m.%Y %H:%M}–{last:%d.%m.%Y %H:%M} · koszt {cost:g} pkt · "
+                   f"minimum {min_rr:g}:1 · limit {limit:g} godz.")
+        st.dataframe(pd.DataFrame([
+            {"Sygnał": interval, "Zamknięte pozycje": stats.count, "TP": stats.targets, "SL": stats.stops,
+             "Limit czasu": stats.timeouts, "Średni wynik po kosztach": stats.mean_points}
+            for interval, stats in (("H1", report.h1), ("M5 z kontekstem H1/H4/D1", report.m5))
+        ]), hide_index=True, alt="Historyczne porównanie sygnałów H1 i M5")
+        st.caption("Oba warianty używają tych samych notowań M5 do symulacji wykonania wejść i wyjść. "
+                   "Krótszy interwał służy tu do porównania historycznego.")
 
 
 def render_archived(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame], bars: int) -> None:
@@ -900,25 +1185,73 @@ def render_archived(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame]
     end = data.bar_end("H1", h1.index[-1]).tz_convert(data.TZ_LOCAL)
     st.warning(f"Ostatnia zapisana H1 zamknęła się {end:%d.%m.%Y o %H:%M} (czas polski). "
                "Widok służy do wykresów i testów historycznych.", title="Dane z plików Parquet")
-    interval = st.segmented_control("Interwał wykresu archiwalnego", data.INTERVALS, default="H1",
+    now = min(end, pd.Timestamp.now(tz="UTC"))
+    patterns = harmonics.projections(frames["H4"], now)
+    status = harmonics.track(patterns[-1], h1, now) if patterns else None
+    off = float(cfg["przesunięcie"])
+    short_available = archive.path_for(inst.ticker, "M5").exists()
+    options = (*data.INTERVALS, *data.CHART_INTRADAY) if short_available else data.INTERVALS
+    interval = st.segmented_control("Interwał wykresu archiwalnego", options, default="H1",
                                     key=f"archived_interval_{inst.key}") or "H1"
-    if not frames[interval].empty:
+    chart_frame = frames.get(interval)
+    if interval in data.CHART_INTRADAY:
+        try:
+            chart_frame = engine.load_short_chart(inst.ticker, interval)
+        except (OSError, ValueError) as exc:
+            st.warning(f"Brak zapisanego interwału {interval}: {exc}")
+    if chart_frame is not None and not chart_frame.empty:
         levels = [(str(x["nazwa"]), float(x["poziom"])) for x in cfg["poziomy"] if x.get("poziom")]
-        st.echarts_chart(build_chart(frames[interval], interval, bars, float(cfg["przesunięcie"]), levels, inst.name),
-                         height=640, alt=f"Archiwalny wykres {inst.name} {interval}")
-    render_advisor_validation(inst, cfg, frames)
+        outcome, _, _ = assess_for_display(frames, cfg["plan_ustawienia"], now, live=False)
+        chart_now = max(now, data.bar_end(interval, chart_frame.index[-1])) if interval in data.CHART_INTRADAY else now
+        render_market_chart(inst, chart_frame, interval, bars, off, levels, frames, chart_now,
+                            outcome.proposal if not outcome.reason else None, archived=True)
+    simulation, candles = st.tabs(["Symulacja historyczna", "Świece i układy harmoniczne"])
+    with simulation:
+        render_advisor_validation(inst, cfg, frames)
+        render_timing_validation(inst, cfg, frames)
+    with candles:
+        render_candles(inst, frames, off)
+        render_harmonics(inst, cfg, off, float(h1["close"].iloc[-1]) + off, h1, patterns, status, read_only=True)
+
+
+def render_candles(inst: Instrument, frames: dict[str, pd.DataFrame], off: float) -> None:
+    st.subheader("Japońskie formacje świecowe")
+    interval = st.segmented_control("Interwał formacji", ("H1", "H4", "D1"), default="H1",
+                                    key=f"candle_interval_{inst.key}") or "H1"
+    frame = frames[interval]
+    last = signals.last_closed(frame, interval)
+    if last is None:
+        st.info("Brak zamkniętych świec dla tego interwału.")
+        return
+    closed = frame.loc[:last.name].tail(11)
+    rows = []
+    for i in range(max(0, len(closed) - 10), len(closed)):
+        bar = closed.iloc[i]
+        previous = closed.iloc[i - 1] if i else None
+        names = signals.candle_patterns(bar, previous)
+        rows.append({
+            "Zamknięcie (czas polski)": data.bar_end(interval, bar.name).tz_convert(data.TZ_LOCAL).strftime("%d.%m.%Y %H:%M"),
+            "Otwarcie": round(float(bar["open"]) + off, inst.decimals),
+            "Maksimum": round(float(bar["high"]) + off, inst.decimals),
+            "Minimum": round(float(bar["low"]) + off, inst.decimals),
+            "Zamknięcie": round(float(bar["close"]) + off, inst.decimals),
+            "Formacja": ", ".join(names) or "—",
+        })
+    st.dataframe(pd.DataFrame(rows[::-1]), hide_index=True, alt="Ostatnie zamknięte świece i wykryte formacje")
+    st.caption("Doji, świece z długim cieniem oraz objęcia są oznaczane na podstawie geometrii świec.")
 
 
 def render_harmonics(
     inst: Instrument, cfg: dict, off: float, price: float, h1: pd.DataFrame,
-    patterns: list[harmonics.Projection], status: harmonics.Status | None,
+    patterns: list[harmonics.Projection], status: harmonics.Status | None, *, read_only: bool = False,
 ) -> None:
     st.subheader("Układ harmoniczny AB=CD")
-    enabled = bool(cfg.get(harmonics.ALERT_SETTING))
-    alerts = st.checkbox("Powiadamiaj o zmianie etapu AB=CD", value=enabled, key=f"abcd_alerts_{inst.key}")
-    if alerts != enabled:
-        cfg[harmonics.ALERT_SETTING] = alerts
-        storage.save_settings(cfg, inst.key)
+    if not read_only:
+        enabled = bool(cfg.get(harmonics.ALERT_SETTING))
+        alerts = st.checkbox("Powiadamiaj o zmianie etapu AB=CD", value=enabled, key=f"abcd_alerts_{inst.key}")
+        if alerts != enabled:
+            cfg[harmonics.ALERT_SETTING] = alerts
+            storage.save_settings(cfg, inst.key)
 
     if not patterns or status is None:
         st.info("Brak potwierdzonych punktów A, B i C spełniających warunki AB=CD.")
@@ -991,6 +1324,10 @@ def render(inst: Instrument) -> None:
             st.session_state[f"calib_msg_{k}"] = ("error", "Brak świec H1 do porównania.")
             return
         src = float(h1_now["close"].iloc[-1])
+        problem = contracts.offset_problem(round(xtb - src, dec), src)
+        if problem:
+            st.session_state[f"calib_msg_{k}"] = ("error", f"Cena z xStation {xtb:g}, {inst.ticker} {src:.{dec}f}. {problem}")
+            return
         cfg["przesunięcie"] = round(xtb - src, dec)
         cfg["kalibracja"] = {
             "czas": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
@@ -1031,18 +1368,33 @@ def render(inst: Instrument) -> None:
         cal = cfg.get("kalibracja") or {}
         if cal:
             st.caption(f"Ostatnia kalibracja: {cal.get('czas', '?')} – xStation {cal.get('cena_xtb')} vs {inst.ticker} {cal.get('cena_zrodla')} (świeca {cal.get('świeca', '?')}).")
+        try:
+            calibrated = pd.Timestamp(cal["czas"]).date() if cal.get("czas") else None
+        except ValueError:
+            calibrated = None
+        roll = contracts.roll_warning(k, inst.ticker, calibrated, pd.Timestamp.now(tz=data.TZ_LOCAL).date())
+        if roll:
+            st.warning(roll, icon=":material/event_repeat:")
         bars = st.slider("Liczba świec na wykresie", 60, 600, 200, step=20, key=f"bars_{k}")
         if st.button("Odśwież dane", icon=":material/refresh:", width="stretch", key=f"refresh_{k}"):
             get_frames.clear()
             get_intraday_chart.clear()
             get_quote.clear()
 
+    if k == GOLD.key and not archive_only:
+        spot_panel = st.expander("Cena spot złota i porównanie z xStation", key="gold_spot_panel", on_change="rerun")
+        if spot_panel.open:
+            with spot_panel:
+                render_gold_spot()
+
     if not archive_only:
-        try:
-            frames = get_frames(inst.ticker)
-        except Exception as exc:
-            st.warning(f"Nie udało się pobrać notowań {inst.ticker}: {exc}", title="Błąd pobierania")
-            archive_only = True
+        frames, _ = monitor_view(inst, {})
+        if not frames:
+            try:
+                frames = get_frames(inst.ticker)
+            except Exception as exc:
+                st.warning(f"Nie udało się pobrać notowań {inst.ticker}: {exc}", title="Błąd pobierania")
+                archive_only = True
     if archive_only:
         try:
             archived = engine.load_archived_frames(inst.ticker)
@@ -1073,99 +1425,53 @@ def render(inst: Instrument) -> None:
 
     last = float(frames["H1"]["close"].iloc[-1])
     if manual_off != float(cfg["przesunięcie"]):
-        cfg["przesunięcie"] = manual_off
-        storage.save_settings(cfg, k)  # monitor w tle korzysta z tego samego przesunięcia
+        problem = contracts.offset_problem(manual_off, last)
+        if problem:
+            st.sidebar.error(problem)
+        else:
+            cfg["przesunięcie"] = manual_off
+            storage.save_settings(cfg, k)  # monitor w tle korzysta z tego samego przesunięcia
     off = float(cfg["przesunięcie"])
+    saved_problem = contracts.offset_problem(off, last)
+    if saved_problem and manual_off == off:
+        st.error(f"Zapisane przesunięcie {off:+g} jest nierealnie duże – ceny, poziomy i alerty są przesunięte. "
+                 "Skalibruj je ponownie z ceną z xStation.", icon=":material/error:")
     price = last + off
-    # przy jednej świecy D1 nie ma poprzedniego zamknięcia - zmiana dzienna jest wtedy pomijana
-    prev_close = float(frames["D1"]["close"].iloc[-2]) + off if len(frames["D1"]) >= 2 else None
-    d1, h4, h1 = frames["D1"].iloc[-1], frames["H4"].iloc[-1], frames["H1"].iloc[-1]
+    d1, h1 = frames["D1"].iloc[-1], frames["H1"].iloc[-1]
     levels = [(str(x["nazwa"]), float(x["poziom"])) for x in cfg["poziomy"] if x.get("poziom")]
     pattern_now = pd.Timestamp.now(tz="UTC")
     abcd_patterns = harmonics.projections(frames["H4"], pattern_now)
     abcd = abcd_patterns[-1] if abcd_patterns else None
     abcd_status = harmonics.track(abcd, frames["H1"], pattern_now) if abcd else None
 
-    # ------------------------------------------------------------ KPI
-    with st.container(horizontal=True):
-        day_delta = f"{_num(price - prev_close, dec)} ({(price / prev_close - 1) * 100:+.2f}%)" if prev_close else None
-        st.metric(f"{inst.name} (+ przesunięcie)", _num(price, dec), day_delta, border=True)
-        for label, val, prev, inv in context:
-            if val is None or prev is None:
-                st.metric(label, "brak danych", border=True)
-            else:
-                st.metric(label, f"{val:.2f}", f"{val - prev:+.2f}", delta_color="inverse" if inv else "normal", border=True)
-        st.metric("RSI H1 / H4 / D1", f"{h1['rsi']:.0f} / {h4['rsi']:.0f} / {d1['rsi']:.0f}", border=True)
-        st.metric("ATR D1 / H1", f"{_num(d1['atr'], 0 if dec <= 1 else 1)} / {_num(h1['atr'], 0 if dec <= 1 else 1)}", border=True)
-        st.metric("EMA 200 D1", _num(d1["ema200"] + off, dec), f"{_num(price - d1['ema200'] - off, dec)} od ceny", delta_color="off", border=True)
-        st.metric("USD/PLN", f"{usdpln:.4f}" if usdpln else "brak danych", border=True)
-    last_bar = frames["H1"].index[-1]
-    age_min = (pd.Timestamp.now(tz=last_bar.tz) - last_bar).total_seconds() / 60 - 60  # koniec świecy H1
-    age_txt = "świeca w trakcie" if age_min < 0 else (f"{age_min:.0f} min temu" if age_min < 180 else f"{age_min / 60:.0f} godz. temu (rynek zamknięty lub brak danych)")
-    st.caption(f"Ostatnia świeca H1: {last_bar:%Y-%m-%d %H:%M} (czas polski), {age_txt}. Przesunięcie: {off:+.{dec}f}.")
+    rules_df = signals.evaluate_rules(cfg["reguły"], frames, off, now=frames["H1"].attrs.get("pobrano"))
 
-    # ------------------------------------------------------------ stan techniczny i reguły
-    summary = pd.DataFrame([signals.summarize(frames[i], i) for i in data.INTERVALS])
-    rules_df = signals.evaluate_rules(cfg["reguły"], frames, off)
-
-    left, right = st.columns([3, 2])
-    with left:
-        st.subheader("Stan techniczny")
-        st.dataframe(summary, hide_index=True, alt=f"Trend, RSI, MACD i Bollinger {inst.name} dla D1, H4 i H1")
-    with right:
-        st.subheader("Sygnały z reguł")
-        if rules_df.empty:
-            st.info("Brak reguł. Dodaj je w zakładce Ustawienia poziomów.", icon=":material/info:")
-        else:
-            hits = rules_df[rules_df["Spełniona"]]
-            for _, r in hits.iterrows():
-                st.warning(f"{r['Warunek']} – {r['Znaczenie']}", title=r["Reguła"], icon=":material/notifications_active:")
-            if hits.empty:
-                st.success("Żadna reguła nie jest spełniona na zamkniętych świecach.", icon=":material/check_circle:")
-
-    div_rows = [{"Interwał": i, **d} for i in data.INTERVALS for d in ind.detect_divergences(frames[i])]
-    st.subheader("Dywergencje (ostatnie ~80 świec)")
-    if div_rows:
-        st.dataframe(pd.DataFrame(div_rows), hide_index=True, alt="Wykryte dywergencje RSI i MACD")
-    else:
-        st.caption("Brak dywergencji – ruch ceny jest potwierdzany przez RSI i MACD.")
-
-    # ------------------------------------------------------------ wykres
-    st.subheader("Wykres")
-    options = (*data.INTERVALS, *data.CHART_INTRADAY)
-    interval = st.segmented_control("Interwał wykresu", options, default="H1", key=f"interval_{k}") or "H1"
-    chart_frame = frames.get(interval)
-    if interval in data.CHART_INTRADAY:
-        try:
-            chart_frame = get_intraday_chart(inst.ticker, interval)
-        except Exception as exc:
-            st.warning(f"Nie udało się pobrać świec {interval} z Yahoo Finance: {exc}")
-        else:
-            if chart_frame.empty:
-                st.warning(f"Yahoo Finance nie zwróciło kompletnych świec {interval}.")
-            else:
-                st.caption(f"{interval} · początek ostatniej świecy: {chart_frame.index[-1]:%d.%m.%Y %H:%M} (czas polski).")
-    if chart_frame is not None and not chart_frame.empty:
-        chart_levels = levels
-        if abcd and interval in ("H1", "H4"):
-            chart_levels = [*levels, ("AB=CD · D", abcd.d + off)]
-        st.echarts_chart(
-            build_chart(chart_frame, interval, bars, off, chart_levels, inst.name, abcd),
-            height=640,
-            alt=f"Wykres świecowy {inst.name} {interval} z EMA, Bollingerem, RSI i MACD",
-        )
+    render_live_market(inst, cfg, bars, off, levels, frames)
 
     # ------------------------------------------------------------ zakładki
-    tab_advisor, tab_plan, tab_simulation, tab_journal, tab_rules, tab_fib, tab_risk, tab_notify, tab_replay, tab_edit = st.tabs(
-        ["Doradca", "Plan pozycji", "Symulacja", "Dziennik", "Reguły", "Fibonacci", "Ryzyko pozycji", "Powiadomienia", "Historia alertów", "Ustawienia poziomów"]
+    tab_simulation, tab_advisor, tab_candles, tab_fib, tab_journal, tab_rules, tab_risk, tab_notify, tab_replay, tab_edit = st.tabs(
+        ["Symulacja", "Doradca", "Świece i układy harmoniczne", "Fibonacci", "Dziennik", "Reguły", "Ryzyko pozycji", "Powiadomienia", "Historia alertów", "Ustawienia poziomów"]
     )
 
-    with tab_plan:
-        scenarios = render_plan_tab(inst, cfg, frames, off, price, levels, usdpln)
-    with tab_advisor:
-        render_advisor(inst, cfg, frames, off, price, rules_df, context)
     with tab_simulation:
-        render_simulation(inst, cfg, scenarios, off)
+        render_simulation(inst, cfg)
+        render_advisor_validation(inst, cfg, frames)
+        render_timing_validation(inst, cfg, frames)
+    with tab_advisor:
+        render_live_advisor(inst, cfg, frames, off, context)
+        technical = st.expander("Szczegóły techniczne", key=f"technicals_{k}", on_change="rerun")
+        if technical.open:
+            with technical:
+                summary = pd.DataFrame([signals.summarize(frames[i], i) for i in data.INTERVALS])
+                st.dataframe(summary, hide_index=True, alt=f"Trend i wskaźniki {inst.name} dla D1, H4 i H1")
+                div_rows = [{"Interwał": i, **d} for i in data.INTERVALS for d in ind.detect_divergences(frames[i])]
+                if div_rows:
+                    st.dataframe(pd.DataFrame(div_rows), hide_index=True, alt="Dywergencje RSI i MACD")
+    with tab_candles:
+        render_candles(inst, frames, off)
+        render_harmonics(inst, cfg, off, price, frames["H1"], abcd_patterns, abcd_status)
+        params = cfg["plan_ustawienia"]
+        render_rejection_history(inst, frames, float(params["limit_h"]), float(params["koszt_pkt"]))
     with tab_journal:
         render_journal_tab(inst, cfg, frames, off, usdpln)
     with tab_replay:
@@ -1183,7 +1489,6 @@ def render(inst: Instrument) -> None:
             )
 
     with tab_fib:
-        render_harmonics(inst, cfg, off, price, frames["H1"], abcd_patterns, abcd_status)
         lo_v, lo_t, hi_v, hi_t = ind.auto_fib_swing(frames["D1"])
         top_v, top_t, bot_v, bot_t = ind.auto_fib_decline(frames["D1"])
         st.markdown(
@@ -1312,6 +1617,11 @@ def render(inst: Instrument) -> None:
             st.toast(f"Windows: {ch.get('windows')}, Telegram: {ch.get('telegram')}")
 
     with tab_edit:
+        if cfg["plany"] or cfg["obserwacje wejścia"]:
+            legacy = st.expander("Dotychczasowe plany i obserwacje", key=f"legacy_plans_{k}", on_change="rerun")
+            if legacy.open:
+                with legacy:
+                    render_plan_tab(inst, cfg, frames, off, price, levels, usdpln)
         st.caption(f"Zmiany zapisują się w pliku dane/{storage.settings_path(k).name} po kliknięciu Zapisz.")
         with st.form(f"edit_{k}"):
             price_col = st.column_config.NumberColumn(min_value=0.01, required=True)

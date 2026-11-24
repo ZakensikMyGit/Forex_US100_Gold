@@ -10,13 +10,14 @@ import numpy as np
 import pandas as pd
 
 from . import harmonics, indicators, plan
-from .data import bar_end, bars_between
+from .data import BAR_LENGTH, bar_end, bars_between
 from .signals import rejects_level, trend_series
 
 MIN_HISTORY = 30
 MAX_SIGNAL_AGE = pd.Timedelta(hours=2)
 ALERT_SETTING = "powiadomienia doradcy"
 MIN_VALIDATION_BARS = 250
+ELEVATED_VOLUME = 1.5
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,10 @@ class Proposal:
     @property
     def support_count(self) -> int:
         return sum(vote > 0 for _, vote in self.evidence)
+
+    @property
+    def technical_support_count(self) -> int:
+        return sum(vote > 0 for _, vote in self.evidence[:3])
 
     @property
     def opposition_count(self) -> int:
@@ -101,19 +106,37 @@ class WalkForward:
     windows: tuple[Validation, ...]
 
 
-class Market:
-    """Dane wyrównane do początku i zamknięcia każdej H1, współdzielone przez panel i replay."""
+@dataclass(frozen=True)
+class TimingComparison:
+    start: pd.Timestamp
+    end: pd.Timestamp
+    h1: History
+    m5: History
 
-    def __init__(self, frames: dict[str, pd.DataFrame], now: pd.Timestamp, *, history: bool = False) -> None:
-        source = frames["H1"]
-        self.ends = pd.DatetimeIndex(source.index) + pd.Timedelta(hours=1)
-        count = int(self.ends.searchsorted(now, side="right"))
-        self.h1 = source.iloc[:count]
+
+class Market:
+    """Dane wyrównane do świecy sygnałowej i zamkniętych świec kontekstu."""
+
+    def __init__(self, frames: dict[str, pd.DataFrame], now: pd.Timestamp, *,
+                 history: bool = False, trigger: str = "H1") -> None:
+        self.trigger = trigger
+        source = frames[trigger]
+        self.ends = pd.DatetimeIndex(source.index) + BAR_LENGTH[trigger]
+        observed_at = min(now, source.attrs.get("pobrano", now))
+        count = int(self.ends.searchsorted(observed_at, side="right"))
+        self.bars = source.iloc[:count]
         self.ends = self.ends[:count]
+        self.relative_volume = indicators.relative_volume(
+            self.bars.get("volume", pd.Series(index=self.bars.index, dtype=float)),
+        ).to_numpy()
+        self.close_position = indicators.close_position(self.bars).to_numpy()
         self.daily_lows = frames["D1"]["low"].to_numpy()
         self.daily_highs = frames["D1"]["high"].to_numpy()
-        self.trends = {"H1": trend_series(self.h1).to_numpy()}
-        for interval in ("H4", "D1"):
+        self.trends = {}
+        for interval in ("H1", "H4", "D1"):
+            if interval == trigger:
+                self.trends[interval] = trend_series(self.bars).to_numpy()
+                continue
             frame = frames[interval]
             ends = pd.DatetimeIndex(pd.to_datetime([bar_end(interval, t) for t in frame.index], utc=True))
             mapped = ends.searchsorted(self.ends, side="right") - 1
@@ -123,21 +146,11 @@ class Market:
                 trends[available] = trend_series(frame).to_numpy()[mapped[available]]
             self.trends[interval] = trends
             if interval == "D1":
-                self.daily_at_open = ends.searchsorted(self.h1.index, side="right") - 1
+                self.daily_at_open = ends.searchsorted(self.bars.index, side="right") - 1
 
-        self.waves: list[tuple[harmonics.Pivot, harmonics.Pivot]] = []
-        swing: list[harmonics.Pivot] = []
-        for pivot in harmonics.confirmed_pivots(frames["H4"], now):
-            if swing and swing[-1].high == pivot.high:
-                if (pivot.price <= swing[-1].price if pivot.high else pivot.price >= swing[-1].price):
-                    continue
-                swing[-1] = pivot
-            else:
-                swing.append(pivot)
-            if len(swing) >= 2:
-                self.waves.append((swing[-2], swing[-1]))
+        self.waves = list(harmonics.confirmed_waves(frames["H4"], now))
         confirmations = pd.DatetimeIndex(pd.to_datetime([b.confirmed_at for _, b in self.waves], utc=True))
-        self.wave_at_open = confirmations.searchsorted(self.h1.index, side="right") - 1
+        self.wave_at_open = confirmations.searchsorted(self.bars.index, side="right") - 1
 
         self.rejected_d: dict[pd.Timestamp, Level] = {}
         self.latest_d: Level | None = None
@@ -148,8 +161,8 @@ class Market:
             patterns = patterns[-2:]
         for i, pattern in enumerate(patterns):
             horizon = patterns[i + 1].c.confirmed_at if i + 1 < len(patterns) else now
-            window = bars_between(self.h1, pattern.c.confirmed_at, horizon)
-            reaction = harmonics.track(pattern, window, horizon)
+            window = bars_between(self.bars, pattern.c.confirmed_at, horizon)
+            reaction = harmonics.track(pattern, window, horizon, interval=trigger)
             if reaction.stage == "rejected":
                 self.rejected_d[reaction.at] = Level(
                     "AB=CD", "Strefa D układu AB=CD", pattern.reaction_direction, pattern.d,
@@ -177,19 +190,19 @@ class Market:
         return levels
 
     def assess_bar(self, i: int, cost: float, min_rr: float) -> Assessment:
-        bar = self.h1.iloc[i]
+        bar = self.bars.iloc[i]
         levels = self.levels(i)
         rejected = [level for level in levels if rejects_level(
             bar["open"], bar["high"], bar["low"], bar["close"], level.price, level.direction,
         )]
         if not rejected:
             nearest = min(levels, key=lambda level: abs(bar["close"] - level.price), default=None)
-            return Assessment("Ostatnia zamknięta H1 nie potwierdziła odrzucenia obserwowanych poziomów.", nearest=nearest)
+            return Assessment(f"Ostatnia zamknięta {self.trigger} nie potwierdziła odrzucenia obserwowanych poziomów.", nearest=nearest)
         level = rejected[0]
         if any(other.direction != level.direction for other in rejected[1:]):
             return Assessment("Na tej samej świecy wystąpiły sprzeczne reakcje LONG i SHORT.")
         if not isfinite(bar["atr"]) or bar["atr"] <= 0:
-            return Assessment("Brakuje ATR H1 do wyznaczenia poziomu obrony.", nearest=level)
+            return Assessment(f"Brakuje ATR {self.trigger} do wyznaczenia poziomu obrony.", nearest=level)
 
         direction = level.direction
         sign = 1 if direction == "long" else -1
@@ -202,20 +215,40 @@ class Market:
         # Preferuj AB=CD, następnie Fibo i sesję D1, jeśli cel spełnia warunki planu.
         chosen = next((option for option in options if option[2] is not None and option[2] >= min_rr), options[0])
         level, target, rr = chosen
-        evidence = self.evidence(i, sign)
+        technical = self.evidence(i, sign)
+        volume = self.volume_evidence(i, sign)
+        evidence = (*technical, volume)
         additional_levels = tuple(other.name for other in rejected if other != level)
         proposal = Proposal(level, self.ends[i], entry, stop, target, rr, evidence, additional_levels)
         if rr is None or rr < min_rr:
-            reason = f"Zysk do ryzyka po kosztach jest poniżej minimum {min_rr:g}:1 lub cel jest już za ceną."
-        elif proposal.support_count <= proposal.opposition_count or proposal.support_count < 2:
+            before_cost = plan.reward_to_risk(direction, entry, stop, target, 0)
+            if rr is not None and before_cost is not None and before_cost >= min_rr:
+                reason = (f"Koszt {cost:g} pkt ceny obniża zysk do ryzyka poniżej {min_rr:g}:1 "
+                          f"(przed kosztami {before_cost:.2f}:1, po kosztach {rr:.2f}:1).")
+            else:
+                reason = f"Nawet przy zerowym koszcie układ nie osiąga zysku do ryzyka {min_rr:g}:1."
+        elif proposal.technical_support_count < 2:
             reason = "Za mało zgodnych potwierdzeń z trendu, momentum i reakcji ceny."
+        elif volume[1] < 0:
+            reason = f"Podwyższony wolumen {self.trigger} przy zamknięciu świecy po stronie przeciwnej do kierunku wejścia."
         else:
             reason = ""
         return Assessment(reason, proposal)
 
+    def volume_evidence(self, i: int, sign: int) -> tuple[str, int]:
+        relative, position = self.relative_volume[i], self.close_position[i]
+        if not isfinite(relative) or not isfinite(position):
+            return f"Wolumen {self.trigger} · brak porównywalnych danych", 0
+        if relative < ELEVATED_VOLUME:
+            return f"Wolumen {self.trigger} · {relative:.2f}× mediany, poniżej progu {ELEVATED_VOLUME:g}×", 0
+        band = indicators.CLOSE_QUARTILE
+        direction = int(position >= 1 - band) - int(position <= band)
+        place = {1: "górna ćwiartka", -1: "dolna ćwiartka", 0: "środek zakresu"}[direction]
+        return f"Wolumen {self.trigger} · {relative:.2f}× mediany, zamknięcie: {place}", direction * sign
+
     def evidence(self, i: int, sign: int) -> tuple[tuple[str, int], ...]:
-        bar = self.h1.iloc[i]
-        previous = self.h1.iloc[i - 1] if i > 0 else bar
+        bar = self.bars.iloc[i]
+        previous = self.bars.iloc[i - 1] if i > 0 else bar
         trends = [self.trends[interval][i] for interval in ("H1", "H4", "D1")]
         trend_votes = [1 if trend == "wzrostowy" else -1 if trend == "spadkowy" else 0 for trend in trends]
         trend_vote = int(np.sign(sum(trend_votes) * sign))
@@ -227,7 +260,7 @@ class Market:
         lower_return = bar["low"] < lower < bar["close"]
         upper_return = bar["high"] > upper > bar["close"]
         band_vote = int(lower_return) - int(upper_return)
-        recent = self.h1.iloc[max(0, i - 79):i + 1]
+        recent = self.bars.iloc[max(0, i - 79):i + 1]
         divergences = indicators.detect_divergences(recent)
         earliest = recent.index[max(0, len(recent) - 8)]
         divs = {d["typ"] for d in divergences if d["do"] >= earliest}
@@ -237,7 +270,7 @@ class Market:
             (f"Trend H1, H4 i D1 · {', '.join(trends)}", trend_vote),
             (f"Momentum · RSI {bar['rsi']:.1f}, zmiana {rsi_change:+.1f}, histogram MACD {macd_change:+.3f}", momentum_vote),
             (f"Bollinger · {'powrót od dołu' if band_vote > 0 else 'powrót od góry' if band_vote < 0 else 'brak reakcji'}, "
-             f"dywergencje H1 · {', '.join(sorted(divs)) or 'brak'}", reaction_vote),
+             f"dywergencje {self.trigger} · {', '.join(sorted(divs)) or 'brak'}", reaction_vote),
         )
 
 
@@ -247,9 +280,9 @@ def assess(frames: dict[str, pd.DataFrame], cost: float, min_rr: float,
     if frames["H1"].empty:
         return Assessment("Brak zamkniętych świec H1.")
     market = Market(frames, now)
-    if market.h1.empty or now - market.ends[-1] > MAX_SIGNAL_AGE:
+    if market.bars.empty or now - market.ends[-1] > MAX_SIGNAL_AGE:
         return Assessment("Brak świeżej zamkniętej H1. Czekam na nowe notowania.")
-    outcome = market.assess_bar(len(market.h1) - 1, cost, min_rr)
+    outcome = market.assess_bar(len(market.bars) - 1, cost, min_rr)
     proposal = outcome.proposal
     if live and proposal and not outcome.reason:
         later = bars_between(frames["H1"], proposal.at, now)
@@ -264,7 +297,7 @@ def assess(frames: dict[str, pd.DataFrame], cost: float, min_rr: float,
             if current_rr is None or current_rr < min_rr:
                 return Assessment("Przy bieżącej cenie zysk do ryzyka jest już poniżej ustawionego minimum.", proposal)
     if proposal is None and outcome.nearest is not None and market.latest_d:
-        price = float(market.h1["close"].iloc[-1])
+        price = float(market.bars["close"].iloc[-1])
         nearest = min((outcome.nearest, market.latest_d), key=lambda level: abs(price - level.price))
         return Assessment(outcome.reason, nearest=nearest)
     return outcome
@@ -272,12 +305,15 @@ def assess(frames: dict[str, pd.DataFrame], cost: float, min_rr: float,
 
 def _trades(
     market: Market, cost: float, min_rr: float, limit_h: float, *, start: int = 0, include_baseline: bool = False,
+    execution_m5: pd.DataFrame | None = None,
 ) -> Iterator[ReplayTrade]:
-    opens, highs, lows, closes = (market.h1[col].to_numpy() for col in ("open", "high", "low", "close"))
-    dates = market.h1.index
-    for i in range(start, len(dates) - 1):
-        entry_i = i + 1
-        if dates[entry_i] != market.ends[i]:
+    tape = market.bars if execution_m5 is None else execution_m5
+    opens, highs, lows, closes = (tape[col].to_numpy() for col in ("open", "high", "low", "close"))
+    dates = tape.index
+    ends = market.ends if execution_m5 is None else dates + BAR_LENGTH["M5"]
+    entries = dates.get_indexer(market.ends[start:])
+    for i, entry_i in enumerate(entries, start=start):
+        if entry_i < 0:
             continue
         outcome = market.assess_bar(i, cost, min_rr)
         proposal = outcome.proposal
@@ -293,28 +329,29 @@ def _trades(
         sign = 1 if direction == "long" else -1
         stop, target = proposal.stop, proposal.target
         deadline = dates[entry_i] + pd.Timedelta(hours=limit_h)
-        j, label, exit_price = entry_i, None, None
-        while j < len(dates) and market.ends[j] <= deadline:
-            if (opens[j] - stop) * sign <= 0:
-                label, exit_price = "SL", opens[j]
-            elif (opens[j] - target) * sign >= 0:
-                label, exit_price = "TP", target
-            elif (lows[j] <= stop if sign > 0 else highs[j] >= stop):
-                label, exit_price = "SL", stop
-            elif (highs[j] >= target if sign > 0 else lows[j] <= target):
-                label, exit_price = "TP", target
-            if label:
+        for j in range(entry_i, len(dates)):
+            start_at, end_at = dates[j], ends[j]
+            if start_at >= deadline:
+                label, exit_price, resolved_at = "limit", opens[j], start_at
                 break
-            j += 1
-        if label is None:
-            if market.ends[-1] < deadline:
-                yield ReplayTrade(proposal, not outcome.reason, dates[entry_i], deadline, "otwarta", None)
-                continue
-            if j == entry_i:
-                continue
-            j -= 1
-            label, exit_price = "limit", closes[j]
-        resolved_at = deadline if label == "limit" else market.ends[j]
+            if (opens[j] - stop) * sign <= 0:
+                label, exit_price, resolved_at = "SL", opens[j], start_at
+                break
+            if (opens[j] - target) * sign >= 0:
+                label, exit_price, resolved_at = "TP", target, start_at
+                break
+            if (lows[j] <= stop if sign > 0 else highs[j] >= stop):
+                label, exit_price, resolved_at = "SL", stop, end_at
+                break
+            if (highs[j] >= target if sign > 0 else lows[j] <= target):
+                label, exit_price, resolved_at = "TP", target, end_at
+                break
+            if end_at >= deadline:
+                label, exit_price, resolved_at = "limit", closes[j], end_at
+                break
+        else:
+            yield ReplayTrade(proposal, not outcome.reason, dates[entry_i], deadline, "otwarta", None)
+            continue
         yield ReplayTrade(proposal, not outcome.reason, dates[entry_i], resolved_at,
                           label, (exit_price - actual_entry) * sign - cost)
 
@@ -338,7 +375,7 @@ def _training_history(trades: Iterator[ReplayTrade], as_of: pd.Timestamp | None 
         busy[key] = trade.closed
         if trade.points is None or (as_of is not None and trade.closed > as_of):
             continue
-        results.setdefault((*key, proposal.support_count), []).append(trade)
+        results.setdefault((*key, proposal.technical_support_count), []).append(trade)
         results.setdefault((*key, 0), []).append(trade)
     return {key: _summarize(trades) for key, trades in results.items()}
 
@@ -360,11 +397,11 @@ def validate_later_period(
         return None
     now = pd.Timestamp.now(tz="UTC") if now is None else now
     market = Market(frames, now, history=True)
-    count = len(market.h1)
+    count = len(market.bars)
     if count < MIN_VALIDATION_BARS:
         return None
     start = count * 4 // 5
-    cutoff = market.h1.index[start]
+    cutoff = market.bars.index[start]
     first_period = replay(frames, cost, min_rr, limit_h, cutoff)
     baseline, confirmed = [], []
     for trade in _trades(market, cost, min_rr, limit_h, start=start, include_baseline=True):
@@ -385,11 +422,11 @@ def validate_walk_forward(
         return None
     now = pd.Timestamp.now(tz="UTC") if now is None else now
     market = Market(frames, now, history=True)
-    count = len(market.h1)
+    count = len(market.bars)
     if count < MIN_VALIDATION_BARS:
         return None
     edges = [count * part // 5 for part in (2, 3, 4, 5)]
-    dates = market.h1.index
+    dates = market.bars.index
     trades = list(_trades(market, cost, min_rr, limit_h, include_baseline=True))
     hour = pd.Timedelta(hours=1)
     baseline, confirmed, windows = [], [], []
@@ -416,11 +453,49 @@ def validate_walk_forward(
     return WalkForward(total, tuple(windows))
 
 
+def compare_entry_timing(
+    frames: dict[str, pd.DataFrame], m5: pd.DataFrame, cost: float, min_rr: float, limit_h: float,
+    now: pd.Timestamp,
+) -> TimingComparison | None:
+    """Porównaj sygnały H1 i M5, rozliczając oba na wspólnej taśmie M5."""
+    if m5.empty or frames["H1"].empty:
+        return None
+    h1 = Market(frames, now, history=True)
+    short = Market({**frames, "M5": indicators.add_indicators(m5)}, now, history=True, trigger="M5")
+    if h1.bars.empty or short.bars.empty:
+        return None
+    start = max(h1.bars.index[0], short.bars.index[0])
+    end = min(h1.ends[-1], short.ends[-1])
+    hours = h1.bars.index[(h1.bars.index >= start) & (h1.ends <= end)]
+    tape = short.bars.loc[short.ends <= end]
+    counts = tape.index.searchsorted(hours + BAR_LENGTH["H1"]) - tape.index.searchsorted(hours)
+    hours = hours[counts == BAR_LENGTH["H1"] // BAR_LENGTH["M5"]]
+    if len(hours) < MIN_VALIDATION_BARS:
+        return None
+    edges = [hours[len(hours) * part // 5] for part in (2, 3, 4)] + [end]
+
+    def compare(market: Market) -> History:
+        first = int(market.bars.index.searchsorted(start))
+        trades = list(_trades(market, cost, min_rr, limit_h, start=first, execution_m5=tape))
+        selected: list[ReplayTrade] = []
+        for left, right in zip(edges, edges[1:]):
+            training = _training_history((t for t in trades if t.opened < left), as_of=left)
+            for trade in trades:
+                if not left <= trade.opened < right or (selected and trade.opened < selected[-1].closed):
+                    continue
+                stats, _ = comparable(trade.proposal, training)
+                if not history_hold(stats):
+                    selected.append(trade)
+        return _summarize(selected)
+
+    return TimingComparison(edges[0], end, compare(h1), compare(short))
+
+
 def comparable(proposal: Proposal, history: dict[tuple[str, str, int], History]) -> tuple[History, str]:
     key = proposal.level.family, proposal.level.direction
-    exact = history.get((*key, proposal.support_count))
+    exact = history.get((*key, proposal.technical_support_count))
     if exact and exact.count >= MIN_HISTORY:
-        return exact, f"{proposal.support_count} zgodne grupy wskaźników"
+        return exact, f"{proposal.technical_support_count} zgodne grupy techniczne"
     return history.get((*key, 0), History(0, 0, 0, 0, None)), "wszystkie zgodne sygnały tej rodziny i kierunku"
 
 

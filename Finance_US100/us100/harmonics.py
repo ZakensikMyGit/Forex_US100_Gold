@@ -1,4 +1,4 @@
-"""Projekcja równego AB=CD z potwierdzonych ekstremów H4 i obserwacja strefy D na H1."""
+"""Projekcja równego AB=CD i obserwacja strefy D na zamkniętych świecach."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from .data import bar_end, bars_between
+from .data import TZ_NY, bar_end, bars_between
 from .indicators import swing_points
 from .instruments import price_text
 from .signals import last_closed, rejects_level
@@ -62,11 +62,11 @@ class Status:
     close: float | None = None
 
 
-def confirmed_pivots(h4: pd.DataFrame, now: pd.Timestamp) -> Iterator[Pivot]:
-    last = last_closed(h4, "H4", now)
+def confirmed_pivots(bars: pd.DataFrame, now: pd.Timestamp, *, interval: str = "H4") -> Iterator[Pivot]:
+    last = last_closed(bars, interval, now)
     if last is None:
         return
-    closed = h4.loc[:last.name]
+    closed = bars.loc[:last.name]
     highs, lows = swing_points(closed, k=PIVOT_BARS)
     for time in highs.index.union(lows.index).sort_values():
         high = time in highs.index
@@ -74,14 +74,30 @@ def confirmed_pivots(h4: pd.DataFrame, now: pd.Timestamp) -> Iterator[Pivot]:
             continue  # świeca z oboma ekstremami nie ujawnia ich kolejności
         price = float(highs[time] if high else lows[time])
         confirmation_bar = closed.index[closed.index.get_loc(time) + PIVOT_BARS]
-        yield Pivot(time, bar_end("H4", confirmation_bar), price, high)
+        yield Pivot(time, bar_end(interval, confirmation_bar), price, high)
 
 
-def projections(h4: pd.DataFrame, now: pd.Timestamp) -> list[Projection]:
+def confirmed_waves(
+    bars: pd.DataFrame, now: pd.Timestamp, *, interval: str = "H4",
+) -> Iterator[tuple[Pivot, Pivot]]:
+    """Kolejne fale wyznaczone z potwierdzonych, naprzemiennych ekstremów."""
+    swing: list[Pivot] = []
+    for pivot in confirmed_pivots(bars, now, interval=interval):
+        if swing and swing[-1].high == pivot.high:
+            if (pivot.price <= swing[-1].price if pivot.high else pivot.price >= swing[-1].price):
+                continue
+            swing[-1] = pivot
+        else:
+            swing.append(pivot)
+        if len(swing) >= 2:
+            yield swing[-2], swing[-1]
+
+
+def projections(bars: pd.DataFrame, now: pd.Timestamp, *, interval: str = "H4") -> list[Projection]:
     """Kolejność odpowiada chwilom, w których potwierdzono punkty C."""
     pivots: list[Pivot] = []
     found = []
-    for point in confirmed_pivots(h4, now):
+    for point in confirmed_pivots(bars, now, interval=interval):
         if pivots and pivots[-1].high == point.high:
             if (point.price <= pivots[-1].price if point.high else point.price >= pivots[-1].price):
                 continue
@@ -97,19 +113,25 @@ def projections(h4: pd.DataFrame, now: pd.Timestamp) -> list[Projection]:
     return found
 
 
-def track(projection: Projection, h1: pd.DataFrame, now: pd.Timestamp) -> Status:
-    """Oceń kolejne zamknięte H1, które zaczęły się po ustaleniu projekcji."""
+def track(projection: Projection, bars: pd.DataFrame, now: pd.Timestamp, *, interval: str = "H1") -> Status:
+    """Oceń kolejne świece po potwierdzeniu C, do ostatniej zamkniętej."""
     lower, upper = projection.zone
     upward = projection.leg > 0
     direction = projection.reaction_direction
     status = Status("building", projection.c.confirmed_at)
-    last = last_closed(h1, "H1", now)
-    if last is None or last.name < projection.c.confirmed_at:
+    last = last_closed(bars, interval, now)
+    if last is None:
         return status
 
-    window = bars_between(h1, projection.c.confirmed_at, last.name)
+    if interval == "D1":
+        # Indeks D1 zawiera daty sesji w Nowym Jorku, a nie godziny ich rozpoczęcia.
+        session = projection.c.confirmed_at.tz_convert(TZ_NY).tz_localize(None).normalize()
+        first = bars.index.searchsorted(session, side="right")
+        window = bars.iloc[first:bars.index.get_loc(last.name) + 1]
+    else:
+        window = bars_between(bars, projection.c.confirmed_at, last.name)
     for bar in window[["open", "high", "low", "close"]].itertuples():
-        closed_at = bar_end("H1", bar.Index)
+        closed_at = bar_end(interval, bar.Index)
         if (upward and bar.close < projection.c.price) or (not upward and bar.close > projection.c.price):
             return Status("invalid_c", closed_at, bar.close)
         if (upward and bar.close > upper) or (not upward and bar.close < lower):

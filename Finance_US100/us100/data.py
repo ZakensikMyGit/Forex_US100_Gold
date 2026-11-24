@@ -23,7 +23,10 @@ TICKER_USDPLN = "USDPLN=X"
 
 INTERVALS = ("D1", "H4", "H1")
 CHART_INTRADAY = {"M15": "15m", "M5": "5m"}
-BAR_LENGTH = {"H1": timedelta(hours=1), "H4": timedelta(hours=4)}
+BAR_LENGTH = {
+    "H1": timedelta(hours=1), "H4": timedelta(hours=4),
+    **{interval: pd.Timedelta(duration) for interval, duration in CHART_INTRADAY.items()},
+}
 
 _OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -54,9 +57,9 @@ def load_hourly(ticker: str = TICKER_NQ, period: str = "730d") -> pd.DataFrame:
     return _local_intraday(_history(ticker, period, "1h"))
 
 
-def load_intraday(ticker: str, interval: str) -> pd.DataFrame:
-    """Miesiąc krótkich świec do wykresu, w czasie polskim."""
-    return _local_intraday(_history(ticker, "1mo", CHART_INTRADAY[interval])).sort_index()
+def load_intraday(ticker: str, interval: str, period: str = "1mo") -> pd.DataFrame:
+    """Krótkie świece z Yahoo Finance w czasie polskim."""
+    return _local_intraday(_history(ticker, period, CHART_INTRADAY[interval])).sort_index()
 
 
 def _local_intraday(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,6 +112,11 @@ def bars_between(frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) ->
 
 def _wall(naive: Any, tz) -> pd.Timestamp:
     return naive.tz_localize(tz, ambiguous=False, nonexistent="shift_forward")
+
+
+def local_timestamp(value: Any) -> pd.Timestamp:
+    stamp = pd.Timestamp(value)
+    return _wall(stamp, TZ_LOCAL) if stamp.tzinfo is None else stamp.tz_convert(TZ_LOCAL)
 
 
 def bar_end(interval: str, bar_start: Any) -> pd.Timestamp:

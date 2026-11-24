@@ -1,14 +1,13 @@
-"""Symulacja na kolejnych zamkniętych świecach H1 po włączeniu scenariusza."""
+"""Pozycje wirtualne Doradcy i zapisanych scenariuszy na danych H1."""
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-import uuid
 
 import pandas as pd
 
-from . import delivery, plan, storage
+from . import advisor, delivery, plan, storage
 
 HOUR = pd.Timedelta(hours=1)
 MODEL_VERSION = 2
@@ -28,6 +27,7 @@ def positions(state: dict) -> pd.DataFrame:
     for status, records in (("otwarta", state.get("otwarte", {}).values()), ("zamknięta", state.get("zamknięte", []))):
         for position in records:
             row = {"status": status, **position}
+            row.setdefault("źródło", "Zapisany scenariusz")
             row.setdefault("sl początkowy", row.get("sl"))
             row.setdefault("zmiany SL", 0)
             row.setdefault("description", None)
@@ -39,9 +39,12 @@ def csv_bytes(rows: pd.DataFrame) -> bytes:
     return rows.to_csv(index=False).encode("utf-8-sig")
 
 
-def update(key: str, cfg: dict, frames: dict[str, pd.DataFrame]) -> None:
+def update(key: str, cfg: dict, frames: dict[str, pd.DataFrame], *, observed_at: pd.Timestamp | None = None) -> None:
     previous = load(key)
-    state = advance(key, cfg.get("symulacja", {}), frames, previous)
+    now = pd.Timestamp.now(tz="UTC") if observed_at is None else observed_at
+    state = advance(key, cfg.get("symulacja", {}), frames, previous, now)
+    if cfg.get("symulacja doradcy", True):
+        state = _advisor_entry(key, cfg, frames, state, now)
     if state != previous:
         delivery.write_json(storage.DATA_DIR / f"symulacja_{key}.json", state)
     if state.get("otwarte") or state.get("zamknięte"):
@@ -54,14 +57,45 @@ def update(key: str, cfg: dict, frames: dict[str, pd.DataFrame]) -> None:
             temporary.replace(path)
 
 
-def new_scenario(key: str, entry: float, sl: float, tp: float, settings: dict, off: float) -> dict:
-    return {
-        "id": uuid.uuid4().hex,
-        "aktywacja": pd.Timestamp.now(tz="UTC").isoformat(),
-        "próg": entry, "sl": sl, "tp": tp, "przesunięcie": off,
-        "wolumen": VOLUME_BY_INSTRUMENT[key], "limit godzin": settings["limit_h"],
-        "koszt pkt": settings["koszt_pkt"], "min rr": settings["min_rr"],
+def _advisor_entry(
+    key: str, cfg: dict, frames: dict[str, pd.DataFrame], state: dict, now: pd.Timestamp,
+) -> dict:
+    opened = state.get("otwarte", {})
+    h1 = frames["H1"]
+    if "doradca" in opened or h1.empty:
+        return state
+    start = h1.index[-1]
+    if not start <= now < start + HOUR or state.get("sygnał Doradcy") == start.isoformat():
+        return state
+    settings = cfg["plan_ustawienia"]
+    cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+    assessment = advisor.assess(frames, cost, min_rr, now, live=True)
+    proposal = assessment.proposal
+    if proposal is None or assessment.reason or proposal.at != start:
+        return state
+    marked = {**state, "sygnał Doradcy": start.isoformat()}
+    history, _ = advisor.comparable(proposal, advisor.replay(frames, cost, min_rr, limit, proposal.at))
+    if advisor.history_hold(history):
+        return marked
+    entry = float(h1["close"].iloc[-1])
+    direction = proposal.level.direction
+    rr = plan.reward_to_risk(direction, entry, proposal.stop, proposal.target, cost)
+    if rr is None or rr < min_rr:
+        return state
+    off = float(cfg.get("przesunięcie", 0))
+    position = {
+        "id": f"doradca-{int(start.timestamp())}", "źródło": "Doradca", "instrument": key,
+        "wersja symulacji": MODEL_VERSION, "kierunek": direction, "otwarto": now.isoformat(),
+        "cena wejścia": entry + off, "sl": proposal.stop + off, "sl początkowy": proposal.stop + off,
+        "tp": proposal.target + off, "wolumen": VOLUME_BY_INSTRUMENT[key], "limit godzin": limit,
+        "koszt pkt": cost, "przesunięcie": off, "rr wejścia": rr,
+        "zmiany SL": 0, "wynik otwarty pkt": -cost, "maks. wynik pkt": -cost, "przerwa H1": False,
+        "description": (f"Doradca wskazał {direction.upper()} po odrzuceniu poziomu {proposal.level.name} "
+                        f"na zamknięciu H1 {proposal.at.isoformat()}. Wirtualne wejście po ostatniej cenie "
+                        f"w monitorze, zysk do ryzyka {rr:.2f}:1. {history.description()}"),
     }
+    return {**marked, "sprawdzono": state.get("sprawdzono", start.isoformat()),
+            "otwarte": {**opened, "doradca": position}}
 
 
 def _exit(position: dict, bar: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> tuple[str, float, pd.Timestamp, str] | None:
@@ -173,7 +207,8 @@ def advance(
     if start_at := previous.get("sprawdzono"):
         cursor = pd.Timestamp(start_at)
     else:
-        cursor = min(pd.Timestamp(s["aktywacja"]) for s in scenarios.values())
+        cursor = min([pd.Timestamp(s["aktywacja"]) for s in scenarios.values()]
+                     + [pd.Timestamp(p["otwarto"]) for p in opened.values()])
     index = pd.DatetimeIndex(h1.index)
     bars = h1[(index + HOUR > cursor) & (index + HOUR <= now)]
     if bars.empty:
@@ -184,16 +219,18 @@ def advance(
              if any(s["id"] == s_id for s in scenarios.values())}
     for start, bar in bars.iterrows():
         end = start + HOUR
-        for direction, pos in list(opened.items()):
+        for position_key, pos in list(opened.items()):
+            if position_key == "doradca" and start < pd.Timestamp(pos["otwarto"]):
+                continue  # Zakres świecy wejścia zawiera też ceny sprzed wejścia.
             if start > cursor:
-                pos = opened[direction] = {**pos, "przerwa H1": True}
+                pos = opened[position_key] = {**pos, "przerwa H1": True}
             result = _exit(pos, bar, start, end)
             if result is None:
                 price = float(bar["close"]) + pos["przesunięcie"]
-                opened[direction] = _update_open_position(pos, price, end)
+                opened[position_key] = _update_open_position(pos, price, end)
                 continue
             reason, price, when, detail = result
-            sign = 1 if direction == "long" else -1
+            sign = 1 if pos["kierunek"] == "long" else -1
             pnl = (price - pos["cena wejścia"]) * sign - pos["koszt pkt"]
             initial_sl = pos.get("sl początkowy", pos["sl"])
             risk = abs(pos["cena wejścia"] - initial_sl) + pos["koszt pkt"]
@@ -204,7 +241,7 @@ def advance(
                            "sl początkowy": initial_sl, "wynik otwarty pkt": None,
                            "powód": reason, "wynik pkt": round(pnl, 6), "wynik R": round(pnl / risk, 6),
                            "godziny": (when - pd.Timestamp(pos["otwarto"])).total_seconds() / 3600})
-            del opened[direction]
+            del opened[position_key]
 
         for direction, scenario in scenarios.items():
             if end <= pd.Timestamp(scenario["aktywacja"]):
@@ -213,8 +250,9 @@ def advance(
             signal = plan.entry_signal(direction, scenario, frames, price, end, include_evidence=True)
             first = scenario["id"] not in ready
             was_ready = ready.get(scenario["id"], False)
-            ready[scenario["id"]] = signal is not None
-            if signal is None or was_ready or direction in opened:
+            eligible = signal is not None and signal["rr"] >= scenario["min rr"]
+            ready[scenario["id"]] = eligible
+            if signal is None or not eligible or was_ready or direction in opened:
                 continue
             features = {name: float(bar[name]) if math.isfinite(bar[name]) else None
                         for name in ("rsi", "atr", "macd", "ema9", "ema26", "ema50", "ema200")}
@@ -229,4 +267,4 @@ def advance(
                 "description": _entry_description(key, direction, entry_params, bar, signal, first),
             }
         cursor = end
-    return {"sprawdzono": cursor.isoformat(), "otwarte": opened, "zamknięte": closed, "warunki": ready}
+    return {**previous, "sprawdzono": cursor.isoformat(), "otwarte": opened, "zamknięte": closed, "warunki": ready}

@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import math
 import uuid
-from typing import Any
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 
 import pandas as pd
 
 from . import indicators as ind
-from .data import bar_end
+from .data import TZ_LOCAL, bar_end, local_timestamp
 from .instruments import price_text
 from .signals import NO_DATA, last_closed, rejects_level, trend_series
 
@@ -240,7 +240,7 @@ def new_plan(direction: str, entry: float, sl: float, tp: float, volume: float, 
         "wolumen": float(volume),
         "limit godzin": float(limit_h),
         "warunek wejścia": float(trigger) if trigger else None,
-        "otwarto": datetime.now().isoformat(timespec="minutes"),
+        "otwarto": pd.Timestamp.now(tz=TZ_LOCAL).isoformat(timespec="minutes"),
         "notatka": note,
         "status": "otwarty",
     }
@@ -251,7 +251,7 @@ def validate_plan(direction: str, entry: float, sl: float, tp: float, volume: fl
     errs = []
     if direction not in DIRECTIONS:
         errs.append("kierunek musi być long albo short")
-    if entry <= 0 or sl <= 0 or tp <= 0:
+    if not all(math.isfinite(value) and value > 0 for value in (entry, sl, tp)):
         errs.append("ceny muszą być większe od zera")
     if (entry - sl) * sign <= 0:
         errs.append("SL musi być " + ("poniżej" if sign > 0 else "powyżej") + " ceny wejścia")
@@ -259,17 +259,17 @@ def validate_plan(direction: str, entry: float, sl: float, tp: float, volume: fl
         errs.append("TP musi być " + ("powyżej" if sign > 0 else "poniżej") + " ceny wejścia")
     if not math.isfinite(volume) or volume <= 0:
         errs.append("wolumen musi być większy od zera")
-    if limit_h <= 0:
+    if not math.isfinite(limit_h) or limit_h <= 0:
         errs.append("limit czasu musi być większy od zera")
     return errs
 
 
 def plan_status(plan: dict, price: float, usd_per_point: float, usdpln: float | None, now: datetime | None = None) -> dict:
-    now = now or datetime.now()
+    checked = pd.Timestamp.now(tz=TZ_LOCAL) if now is None else local_timestamp(now)
     sign = 1 if plan["kierunek"] == "long" else -1
     entry, sl, tp, vol = plan["cena wejścia"], plan["sl"], plan["tp"], plan["wolumen"]
-    opened = datetime.fromisoformat(plan["otwarto"])
-    left_h = plan["limit godzin"] - (now - opened).total_seconds() / 3600
+    opened = local_timestamp(plan["otwarto"])
+    left_h = plan["limit godzin"] - (checked - opened).total_seconds() / 3600
     points = (price - entry) * sign
     pnl_pln = money(points, vol, usd_per_point, usdpln)
     return {
@@ -285,32 +285,44 @@ def plan_status(plan: dict, price: float, usd_per_point: float, usdpln: float | 
         "Wynik teraz [pkt]": round(points, 2),
         "Wynik teraz [USD]": round(points * vol * usd_per_point, 2),
         "Wynik teraz [PLN]": round(pnl_pln, 2) if pnl_pln is not None else None,
-        "Otwarto": plan["otwarto"].replace("T", " "),
+        "Otwarto": opened.strftime("%Y-%m-%d %H:%M"),
         "Zostało godzin": round(left_h, 1),
     }
-
-
-def _local(iso: str) -> Any:
-    """Czas otwarcia zapisany w czasie polskim (bez strefy) -> Timestamp ze strefą."""
-    ts = pd.Timestamp(iso)
-    return ts.tz_localize("Europe/Warsaw") if ts.tzinfo is None else ts
 
 
 def check_plan_events(
     plans: list[dict], frames: dict[str, pd.DataFrame], off: float, window: pd.DataFrame, flags: dict,
     now: datetime | None = None, *, decimals: int = 2,
 ) -> tuple[list[tuple[str, str]], dict]:
+    """Zwraca tytuły i treść alertów planu."""
+    alerts, new_flags = timed_plan_events(plans, frames, off, window, flags, now, decimals=decimals)
+    return [(alert.title, alert.body) for alert in alerts], new_flags
+
+
+@dataclass(frozen=True)
+class PlanAlert:
+    title: str
+    body: str
+    at: pd.Timestamp | None = None
+    time_label: str = "Sygnał"
+
+
+def timed_plan_events(
+    plans: list[dict], frames: dict[str, pd.DataFrame], off: float, window: pd.DataFrame, flags: dict,
+    now: datetime | None = None, *, decimals: int = 2,
+) -> tuple[list[PlanAlert], dict]:
     """Zdarzenia dla otwartych planów. window = świece H1 od ostatniego sprawdzenia (ceny źródła).
 
     Każde zdarzenie zgłaszane jest raz na plan (flagi w stanie monitora).
     """
-    now = now or datetime.now()
-    out: list[tuple[str, str]] = []
+    checked = pd.Timestamp.now(tz=TZ_LOCAL) if now is None else local_timestamp(now)
+    out: list[PlanAlert] = []
     new_flags: dict = {}
     lows, highs = window["low"] + off, window["high"] + off
     h1 = frames["H1"]
     price = float(h1["close"].iloc[-1]) + off
-    closed = last_closed(h1, "H1")
+    closed = last_closed(h1, "H1", checked)
+    latest_possible = min(checked, bar_end("H1", h1.index[-1]))
     for p in plans:
         if p.get("status", "otwarty") != "otwarty":
             continue
@@ -321,31 +333,42 @@ def check_plan_events(
         reference = f"Wejście {price_text(entry, decimals)} · plan {p['id']}."
 
         # Tylko ruch PO otwarciu: liczą się świece H1, które zaczęły się nie wcześniej niż wejście,
-        # oraz bieżąca cena (odczyt jest zawsze po otwarciu). Zakres świecy, w której otwarto
+        # oraz bieżąca cena, jeśli ostatni odczyt obejmuje czas po otwarciu. Zakres świecy, w której otwarto
         # pozycję, jest pomijany - nie da się w niej oddzielić ruchu sprzed i po wejściu.
-        opened_ts = _local(p["otwarto"])
+        opened_ts = local_timestamp(p["otwarto"])
+        current = latest_possible > opened_ts
         after = window.index >= opened_ts
         lo_after, hi_after = lows[after], highs[after]
-        sl_hit = bool((lo_after <= sl).any() or price <= sl) if sign > 0 else bool((hi_after >= sl).any() or price >= sl)
-        tp_hit = bool((hi_after >= tp).any() or price >= tp) if sign > 0 else bool((lo_after <= tp).any() or price <= tp)
-        if sl_hit and not f.get("sl"):
+        sl_bars = lo_after <= sl if sign > 0 else hi_after >= sl
+        tp_bars = hi_after >= tp if sign > 0 else lo_after <= tp
+        sl_at = sl_bars.idxmax() if sl_bars.any() else None
+        tp_at = tp_bars.idxmax() if tp_bars.any() else None
+        if not f.get("sl") and (sl_at is not None or (current and (price - sl) * sign <= 0)):
             f["sl"] = True
-            out.append((f"{direction}: cena dotarła do stop loss (SL)",
-                        f"Dane panelu pokazały osiągnięcie SL {price_text(sl, decimals)}. "
-                        f"Sprawdź wykonanie zlecenia w xStation.\n{reference}"))
-        if tp_hit and not f.get("tp"):
+            out.append(PlanAlert(
+                f"{direction}: cena dotarła do stop loss (SL)",
+                f"Dane panelu pokazały osiągnięcie SL {price_text(sl, decimals)}. "
+                f"Sprawdź wykonanie zlecenia w xStation.\n{reference}",
+                sl_at, "Świeca H1",
+            ))
+        if not f.get("tp") and (tp_at is not None or (current and (price - tp) * sign >= 0)):
             f["tp"] = True
-            out.append((f"{direction}: cena dotarła do celu zysku (TP)",
-                        f"Dane panelu pokazały osiągnięcie TP {price_text(tp, decimals)}. "
-                        f"Sprawdź wykonanie zlecenia w xStation.\n{reference}"))
+            out.append(PlanAlert(
+                f"{direction}: cena dotarła do celu zysku (TP)",
+                f"Dane panelu pokazały osiągnięcie TP {price_text(tp, decimals)}. "
+                f"Sprawdź wykonanie zlecenia w xStation.\n{reference}",
+                tp_at, "Świeca H1",
+            ))
 
         risk = abs(entry - sl)
         to_sl = (price - sl) * sign
-        if risk and not f.get("sl") and to_sl <= 0.25 * risk and not f.get("blisko_sl"):
+        if current and risk and not f.get("sl") and to_sl <= 0.25 * risk and not f.get("blisko_sl"):
             f["blisko_sl"] = True
-            out.append((f"{direction}: blisko stop loss (SL)",
-                        f"Cena w panelu: {price_text(price, decimals)}. Do SL {price_text(sl, decimals)} zostało "
-                        f"{price_text(to_sl, decimals)} pkt.\n{reference}"))
+            out.append(PlanAlert(
+                f"{direction}: blisko stop loss (SL)",
+                f"Cena w panelu: {price_text(price, decimals)}. Do SL {price_text(sl, decimals)} zostało "
+                f"{price_text(to_sl, decimals)} pkt.\n{reference}",
+            ))
 
         trig = p.get("warunek wejścia")
         # tylko świeca zamknięta po otwarciu pozycji
@@ -354,15 +377,21 @@ def check_plan_events(
             if (c - trig) * sign < 0:
                 f["warunek"] = True
                 side = "poniżej" if sign > 0 else "powyżej"
-                out.append((f"{direction}: warunek wejścia przestał obowiązywać",
-                            f"Świeca H1 zamknęła się na {price_text(c, decimals)}, {side} progu "
-                            f"{price_text(trig, decimals)}. Sprawdź otwarty plan.\n{reference}"))
+                out.append(PlanAlert(
+                    f"{direction}: warunek wejścia przestał obowiązywać",
+                    f"Świeca H1 zamknęła się na {price_text(c, decimals)}, {side} progu "
+                    f"{price_text(trig, decimals)}. Sprawdź otwarty plan.\n{reference}",
+                    bar_end("H1", closed.name), "Zamknięcie H1",
+                ))
 
-        opened = datetime.fromisoformat(p["otwarto"])
-        if now - opened >= timedelta(hours=float(p["limit godzin"])) and not f.get("limit"):
+        deadline = opened_ts + pd.Timedelta(hours=float(p["limit godzin"]))
+        if checked >= deadline and not f.get("limit"):
             f["limit"] = True
-            out.append((f"{direction}: minął limit czasu",
-                        f"Minęło zaplanowane {p['limit godzin']:g} godz. od wejścia. "
-                        f"Sprawdź w xStation, czy pozycja jest nadal otwarta.\n{reference}"))
+            out.append(PlanAlert(
+                f"{direction}: minął limit czasu",
+                f"Minęło zaplanowane {p['limit godzin']:g} godz. od wejścia. "
+                f"Sprawdź w xStation, czy pozycja jest nadal otwarta.\n{reference}",
+                pd.Timestamp(deadline), "Limit czasu",
+            ))
         new_flags[p["id"]] = f
     return out, new_flags
