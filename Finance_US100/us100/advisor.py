@@ -371,19 +371,25 @@ def random_entries(
 
     Każda pozycja z ``reference`` jest powtarzana ``draws`` razy na losowej świecy z okna
     [start, end). Reguła, która nie bije tego wyniku, nie ma przewagi nad przypadkiem."""
-    bars = market.bars
+    distances = [(abs(t.proposal.entry - t.proposal.stop), abs(t.proposal.target - t.proposal.entry))
+                 for t in reference if t.points is not None]
+    return random_with_distances(market.bars, market.ends, distances, cost, limit_h, start, end, draws=draws, seed=seed)
+
+
+def random_with_distances(
+    bars: pd.DataFrame, ends: pd.DatetimeIndex, distances: list[tuple[float, float]], cost: float, limit_h: float,
+    start: pd.Timestamp, end: pd.Timestamp, *, draws: int = RANDOM_DRAWS, seed: int = 0,
+) -> History:
+    """Losowe wejścia dla par (odległość SL, odległość TP) - wspólne dla Doradcy i rodzin sygnałów."""
     prices = tuple(bars[col].to_numpy() for col in ("open", "high", "low", "close"))
-    dates, ends = bars.index, market.ends
+    dates = bars.index
     candidates = np.flatnonzero((dates >= start) & (dates < end))
-    finished = [trade for trade in reference if trade.points is not None]
-    if not len(candidates) or not finished:
+    if not len(candidates) or not distances:
         return History(0, 0, 0, 0, None)
     rng = np.random.default_rng(seed)
     hour = pd.Timedelta(hours=limit_h)
     outcomes: list[tuple[str, float]] = []
-    for trade in finished:
-        risk = abs(trade.proposal.entry - trade.proposal.stop)
-        reward = abs(trade.proposal.target - trade.proposal.entry)
+    for risk, reward in distances:
         for i, sign in zip(rng.choice(candidates, draws), rng.choice((-1, 1), draws)):
             entry = prices[0][i]
             exit_ = _resolve(prices, dates, ends, int(i), int(sign), entry - sign * risk, entry + sign * reward, dates[i] + hour)
@@ -541,10 +547,10 @@ def compare_entry_timing(
     return TimingComparison(edges[0], end, compare(h1), compare(short))
 
 
-def against_chance(label: str, stats: History, chance: History | None) -> tuple[str, str]:
+def against_chance(label: str, stats: History, chance: History | None, z: float = 2.0) -> tuple[str, str]:
     """Ocena wariantu względem losowych wejść: (rodzaj komunikatu, treść).
 
-    Przewaga liczy się tylko wtedy, gdy średni wynik minus dwa błędy standardowe (ok. 95%)
+    Przewaga liczy się tylko wtedy, gdy średni wynik minus z błędów standardowych (domyślnie 2, ok. 95%)
     przekracza zarówno wynik losowych wejść, jak i zero."""
     if chance is None or chance.mean_points is None:
         return "info", f"{label}: brak losowych wejść do porównania."
@@ -552,7 +558,7 @@ def against_chance(label: str, stats: History, chance: History | None) -> tuple[
         return "info", (f"{label}: za mało zakończonych pozycji ({stats.count}/{MIN_HISTORY}), "
                         "żeby porównać z losowymi wejściami.")
     bar = max(chance.mean_points, 0.0)
-    margin = 2 * stats.std_points / sqrt(stats.count) if stats.std_points else 0.0
+    margin = z * stats.std_points / sqrt(stats.count) if stats.std_points else 0.0
     numbers = (f"średnio {stats.mean_points:+.2f} pkt (±{margin:.2f}) przy {stats.count} pozycjach, "
                f"losowe wejścia {chance.mean_points:+.2f} pkt")
     if stats.mean_points - margin > bar:
