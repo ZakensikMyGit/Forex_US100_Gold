@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .data import bar_end
-from .signals import NO_DATA, level_hits, rejects_level, trend_series
+from .signals import NO_DATA, last_closed, level_hits, rejects_level, trend_series
 
 MIN_SAMPLE = 20
 
@@ -28,11 +28,8 @@ MIN_SAMPLE = 20
 
 
 def _closed_only(df: pd.DataFrame, interval: str, now: pd.Timestamp) -> pd.DataFrame:
-    if df.empty:
-        return df
-    if now < bar_end(interval, df.index[-1]):
-        return df.iloc[:-1]
-    return df
+    bar = last_closed(df, interval, now)
+    return df.loc[:bar.name] if bar is not None else df.iloc[:0]
 
 
 def replay_alerts(
@@ -268,6 +265,8 @@ def plan_history(
     t4 = _trend_at(h1_end, frames["H4"], "H4")
     td = _trend_at(h1_end, frames["D1"], "D1")
     ok = ((c - entry) * sign > 0) & ~np.isin(t4, [against, NO_DATA]) & ~np.isin(td, [against, NO_DATA])
+    risk, reward = (c - sl) * sign, (tp - c) * sign
+    ok &= (risk > 0) & (reward > 0) & (reward - cost_pts >= min_rr * (risk + cost_pts))
     starts = np.flatnonzero(ok & ~np.r_[True, ok[:-1]])  # przejście na "komplet spełniony"
 
     hours = _hours(h1)
@@ -277,8 +276,6 @@ def plan_history(
         if i <= busy_until or i + 1 >= len(h1):
             continue
         px = c[i]
-        if (px - sl) * sign <= 0 or (tp - px) * sign <= 0:
-            continue  # zamknięcie już za SL albo za TP - wejście nie miałoby sensu
         res = _track(h1, hours, int(i), sign, sl - off, tp - off, limit_h)
         if res is None:
             continue
@@ -303,7 +300,7 @@ def rejection_history(
     h1, daily = frames["H1"], frames["D1"]
     if len(h1) < 2 or daily.empty:
         return pd.DataFrame(columns=columns)
-    h1 = h1[h1.index + pd.Timedelta(hours=1) <= now]
+    h1 = _closed_only(h1, "H1", now)
     if len(h1) < 2:
         return pd.DataFrame(columns=columns)
 

@@ -6,7 +6,7 @@ nie było zgłaszane wielokrotnie. Wysyłka i ponawianie: moduł delivery.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +17,7 @@ from . import harmonics
 from . import indicators as ind
 from . import plan
 from .instruments import ALL, price_text
-from .data import bar_end
+from .data import TZ_LOCAL, bar_end, local_timestamp
 from .signals import evaluate_rules, last_closed, level_hits
 
 DATA_DIR = delivery.DATA_DIR
@@ -59,8 +59,20 @@ def pending(instrument: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------- wykrywanie zdarzeń
 
 
-def make_event(title: str, body: str, instrument: str = "US100") -> dict:
-    return {"czas": datetime.now().strftime("%Y-%m-%d %H:%M"), "instrument": instrument, "tytuł": title, "treść": body}
+def make_event(
+    title: str, body: str, instrument: str = "US100", *,
+    at: date | None = None, time_label: str = "Sygnał",
+) -> dict:
+    event = {
+        "czas": pd.Timestamp.now(tz=TZ_LOCAL).strftime("%Y-%m-%d %H:%M"),
+        "instrument": instrument, "tytuł": title, "treść": body,
+    }
+    if at is not None:
+        if isinstance(at, datetime) and at.tzinfo is not None:
+            at = pd.Timestamp(at).tz_convert(TZ_LOCAL)
+        event["czas rynkowy"] = at.isoformat()
+        event["opis czasu"] = time_label
+    return event
 
 
 def _fmt(x: float, instrument: str = "US100") -> str:
@@ -83,29 +95,42 @@ def _divergence_event(divergence: dict, frame: pd.DataFrame, interval: str, off:
         f"{indicator} {change} z {a:.{decimals}f} do {b:.{decimals}f}.\n"
         f"{status}. Zobacz wykres {interval}."
     )
-    return make_event(f"{direction} ({indicator}, {interval})", body, instrument)
+    at = divergence["do"]
+    if interval == "D1":
+        return make_event(f"{direction} ({indicator}, {interval})", body, instrument,
+                          at=at.date(), time_label="Sesja D1")
+    return make_event(f"{direction} ({indicator}, {interval})", body, instrument,
+                      at=at, time_label=f"Ekstremum {interval}")
 
 
 def check_events(
-    frames: dict[str, pd.DataFrame], cfg: dict, state: dict, instrument: str = "US100"
+    frames: dict[str, pd.DataFrame], cfg: dict, state: dict, instrument: str = "US100", *,
+    observed_at: pd.Timestamp | None = None,
 ) -> tuple[list[dict], dict]:
     """Porównuje bieżący stan z poprzednim i zwraca nowe zdarzenia oraz nowy stan."""
     off = float(cfg.get("przesunięcie", 0) or 0)
+    observed_at = pd.Timestamp.now(tz="UTC") if observed_at is None else observed_at
+    # Nowe przesunięcie (kalibracja) przesuwa wszystkie ceny naraz - to nie jest ruch rynku, więc
+    # reguły i poziomy zapisują nowy stan bez wysyłania alertów, jak przy pierwszym uruchomieniu.
+    recalibrated = "przesunięcie" in state and float(state["przesunięcie"]) != off
     first_run = not state
+    quiet = first_run or recalibrated
     events: list[dict] = []
-    new_state: dict = {"reguły": {}, "dywergencje": [], "rsi": {}, "dotknięcia": dict(state.get("dotknięcia", {}))}
+    new_state: dict = {"reguły": {}, "dywergencje": [], "rsi": {}, "dotknięcia": dict(state.get("dotknięcia", {})),
+                       "przesunięcie": off}
 
     # 1. Reguły - zgłaszamy przejście z "niespełniona" na "spełniona"
-    rules = evaluate_rules(cfg.get("reguły", []), frames, off)
+    rules = evaluate_rules(cfg.get("reguły", []), frames, off, include_closed_at=True, now=observed_at)
     prev_rules = state.get("reguły", {})
     for _, r in rules.iterrows():
         key = f"{r['Reguła']}|{r['Warunek']}"
         hit = bool(r["Spełniona"])
         new_state["reguły"][key] = hit
-        if hit and not prev_rules.get(key, False) and not first_run:
+        if hit and not prev_rules.get(key, False) and not quiet:
             body = (f"Cena zamknięcia {_fmt(r['Ostatnie zamknięcie'], instrument)} spełniła warunek "
                     f"„{r['Warunek']}”.\nZobacz zakładkę „Reguły”.")
-            events.append(make_event(f"Spełniono regułę: {r['Reguła']}", body))
+            events.append(make_event(f"Spełniono regułę: {r['Reguła']}", body, instrument,
+                                     at=r["Czas zamknięcia"], time_label="Zamknięcie świecy"))
 
     # 2. Dywergencje - nowe wpisy
     prev_div = set(state.get("dywergencje", []))
@@ -118,7 +143,7 @@ def check_events(
 
     # 3. RSI wychodzi ze strefy wyprzedania / wykupienia (zamknięte świece H1 i H4)
     for iv in ("H1", "H4"):
-        bar = last_closed(frames[iv], iv)
+        bar = last_closed(frames[iv], iv, observed_at)
         if bar is None or pd.isna(bar["rsi"]):
             continue  # brak zamkniętej świecy albo za krótka historia
         rsi_now = float(bar["rsi"])
@@ -135,8 +160,11 @@ def check_events(
         else:
             continue
         close = _fmt(float(bar["close"]) + off, instrument)
-        events.append(make_event(f"{title} ({iv})", f"RSI: wcześniej {rsi_prev:.1f}, teraz {rsi_now:.1f}. "
-                                                    f"Cena na zamknięciu: {close}. Zobacz wykres {iv}."))
+        events.append(make_event(
+            f"{title} ({iv})", f"RSI: wcześniej {rsi_prev:.1f}, teraz {rsi_now:.1f}. "
+            f"Cena na zamknięciu: {close}. Zobacz wykres {iv}.", instrument,
+            at=bar_end(iv, bar.name), time_label=f"Zamknięcie {iv}",
+        ))
 
     # 4. Poziomy: ta sama definicja co w odtwarzaniu historii (signals.level_hits):
     #    dotknięcie = poziom w zakresie świecy H1, przeskok luką = poziom między zamknięciem
@@ -144,11 +172,11 @@ def check_events(
     #    się od ostatniego sprawdzenia, a przerwę 4 godz. liczymy od końca świecy z trafieniem.
     #    Wszystko na świecach - zmiana przesunięcia przez kalibrację nie jest ruchem rynku.
     h1 = frames["H1"]
-    since = state.get("ostatni_bar")
-    pos = int(np.count_nonzero(np.asarray(h1.index < pd.Timestamp(since)))) if since else len(h1) - 1  # pierwsza świeca >= since
+    since = local_timestamp(state["ostatni_bar"]) if state.get("ostatni_bar") else None
+    pos = int(h1.index.searchsorted(since)) if since is not None else len(h1) - 1
     window = h1.iloc[pos:]
     prev_close = h1["close"].shift(1).iloc[pos:]
-    is_new = (window.index > pd.Timestamp(since)) if since else np.zeros(len(window), dtype=bool)
+    is_new = (window.index > since) if since is not None else np.zeros(len(window), dtype=bool)
     raw = float(h1["close"].iloc[-1])
     price = raw + off
     now = datetime.now()
@@ -163,12 +191,11 @@ def check_events(
             hit_time = bar_end("H1", window.index[i])
             last_hit = new_state["dotknięcia"].get(str(lvl))
             if last_hit:
-                lh = pd.Timestamp(last_hit)
-                lh = lh.tz_localize("Europe/Warsaw") if lh.tzinfo is None else lh  # starszy zapis bez strefy
+                lh = local_timestamp(last_hit)
                 if hit_time - lh < pd.Timedelta(LEVEL_COOLDOWN):
                     continue
             new_state["dotknięcia"][str(lvl)] = hit_time.isoformat()
-            if first_run:
+            if quiet:
                 continue
             level = _fmt(lvl, instrument)
             latest = _fmt(price, instrument)
@@ -183,20 +210,22 @@ def check_events(
                         f"Następna świeca otworzyła się na {opening}. Ostatnia cena w panelu: {latest}.")
             if lv.get("nazwa"):
                 body += f"\nNazwa poziomu: {lv['nazwa']}."
-            events.append(make_event(title, body))
+            label = "Świeca H1" if t_bars[i] else "Otwarcie H1"
+            events.append(make_event(title, body, instrument, at=window.index[i], time_label=label))
 
     # 5. Otwarte plany pozycji: SL, TP, blisko SL, naruszenie warunku wejścia, limit czasu
     inst = ALL.get(instrument)
-    plan_events, new_state["plany"] = plan.check_plan_events(
+    plan_events, new_state["plany"] = plan.timed_plan_events(
         cfg.get("plany", []), frames, off, window, state.get("plany", {}),
-        decimals=inst.decimals if inst is not None else 2,
+        now=observed_at, decimals=inst.decimals if inst is not None else 2,
     )
     if not first_run:
-        events.extend(make_event(t, b) for t, b in plan_events)
+        events.extend(make_event(alert.title, alert.body, instrument, at=alert.at, time_label=alert.time_label)
+                      for alert in plan_events)
 
     watches = cfg.get("obserwacje wejścia", {})
     entry_events, new_state["obserwacje wejścia"] = plan.check_entry_watches(
-        watches, frames, off, state.get("obserwacje wejścia", {}),
+        watches, frames, off, state.get("obserwacje wejścia", {}), observed_at,
     )
     for direction, signal in entry_events.items():
         watch = watches[direction]
@@ -219,12 +248,12 @@ def check_events(
             f"Stop loss (SL): {_fmt(watch['sl'], instrument)}. Cel zysku (TP): {_fmt(watch['tp'], instrument)}.\n"
             f"{ratio} Sprawdź „Plan pozycji”."
         )
-        event = make_event(title, text, instrument)
+        event = make_event(title, text, instrument, at=pd.Timestamp(signal["świeca"]), time_label="Zamknięcie H1")
         event["id"] = f"wejscie-{instrument}-{watch['id']}"
         events.append(event)
 
     if cfg.get(harmonics.ALERT_SETTING):
-        checked_at = pd.Timestamp.now(tz="UTC")
+        checked_at = observed_at
         patterns = harmonics.projections(frames["H4"], checked_at)
         new_state["AB=CD"] = None
         if patterns:
@@ -234,35 +263,49 @@ def check_events(
             new_state["AB=CD"] = signature
             if "AB=CD" in state and state["AB=CD"] != signature:
                 title, body = harmonics.describe(projection, status, off, inst.decimals if inst else 2)
-                event = make_event(title, body, instrument)
+                event = make_event(title, body, instrument, at=status.at, time_label="Etap AB=CD")
                 event["id"] = f"abcd-{instrument}-{projection.id}-{status.stage}"
                 events.append(event)
 
+    previous = state.get("doradca")
+    if "doradca" in state:
+        new_state["doradca"] = previous
+    if "wynik sygnału doradcy" in state:
+        new_state["wynik sygnału doradcy"] = state["wynik sygnału doradcy"]
     if cfg.get(advisor.ALERT_SETTING):
         settings = cfg["plan_ustawienia"]
         cost, min_rr, limit = (float(settings[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
-        assessment = advisor.assess(frames, cost, min_rr, live=True)
+        assessment = advisor.assess(frames, cost, min_rr, observed_at, live=True)
         proposal = assessment.proposal
-        previous = state.get("doradca")
-        new_state["doradca"] = previous
+        decision = assessment.reason
         if proposal and not assessment.reason:
             signal_at = proposal.at.isoformat()
             if previous != signal_at:
+                history, group = advisor.comparable(proposal, advisor.replay(frames, cost, min_rr, limit, proposal.at))
                 new_state["doradca"] = signal_at
-                if "doradca" in state:
-                    history, group = advisor.comparable(proposal, advisor.replay(frames, cost, min_rr, limit, proposal.at))
-                    if not advisor.history_hold(history):
-                        direction = proposal.level.direction.upper()
-                        body = (
-                            f"H1 odrzuciła {proposal.level.name} ({_fmt(proposal.level.price + off, instrument)}). "
-                            f"Zgodne grupy wskaźników: {proposal.support_count}/3.\n"
-                            f"Cena sygnału {_fmt(proposal.entry + off, instrument)} · SL {_fmt(proposal.stop + off, instrument)} "
-                            f"· TP {_fmt(proposal.target + off, instrument)} · zysk do ryzyka {proposal.rr:.2f}:1 po kosztach.\n"
-                            f"{history.description()} Próba: {group}."
-                        )
-                        event = make_event(f"Doradca · Propozycja {direction}", body, instrument)
-                        event["id"] = f"doradca-{instrument}-{int(proposal.at.timestamp())}"
-                        events.append(event)
+                decision = advisor.history_hold(history)
+                if not decision:
+                    direction = proposal.level.direction.upper()
+                    body = (
+                        f"H1 odrzuciła {proposal.level.name} ({_fmt(proposal.level.price + off, instrument)}). "
+                        f"Zgodne grupy wskaźników: {proposal.support_count}/{len(proposal.evidence)}.\n"
+                        f"Cena sygnału {_fmt(proposal.entry + off, instrument)} · SL {_fmt(proposal.stop + off, instrument)} "
+                        f"· TP {_fmt(proposal.target + off, instrument)} · zysk do ryzyka {proposal.rr:.2f}:1 po kosztach.\n"
+                        f"{history.description()} Próba: {group}."
+                    )
+                    event = make_event(f"Doradca · Propozycja {direction}", body, instrument,
+                                       at=proposal.at, time_label="Zamknięcie H1")
+                    event["id"] = f"doradca-{instrument}-{int(proposal.at.timestamp())}"
+                    events.append(event)
+                    decision = f"Propozycja {direction} trafiła do kolejki powiadomień."
+                new_state["wynik sygnału doradcy"] = decision
+            else:
+                decision = state.get("wynik sygnału doradcy", "Sygnał z tej świecy H1 został już oceniony.")
+        closed = last_closed(h1, "H1", observed_at)
+        new_state["ocena doradcy"] = {
+            "świeca": bar_end("H1", closed.name).isoformat() if closed is not None else None,
+            "powód": decision,
+        }
 
     new_state["ostatni_bar"] = str(h1.index[-1])
     new_state["cena"] = price

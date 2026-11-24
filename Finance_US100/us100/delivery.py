@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "dane"
@@ -47,9 +47,12 @@ def read_json(path: Path, default):
 def write_json(path: Path, obj) -> None:
     """Zapis atomowy przez plik tymczasowy."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -188,7 +191,8 @@ def enqueue(events: list[dict]) -> None:
             e.setdefault("id", uuid.uuid4().hex)
             if e["id"] in known:
                 continue
-            e.setdefault("utworzono", datetime.now().isoformat(timespec="seconds"))
+            known.add(e["id"])
+            e.setdefault("utworzono", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             e["kanały"] = {ch: "oczekuje" for ch in CHANNELS}
             e["próby"] = 0
             q.append(e)
@@ -203,6 +207,25 @@ def _append_log(event: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _dated_body(event: dict) -> str:
+    """W ponowieniach pokazuje zapisany czas, zamiast godziny wysyłki."""
+    body = event["treść"]
+    for value, label in (
+        (event.get("czas rynkowy"), event.get("opis czasu", "Sygnał")),
+        (event.get("czas"), "Wykryto"),
+        (event.get("utworzono"), "Dodano do kolejki"),
+    ):
+        if not isinstance(value, str):
+            continue
+        try:
+            stamp = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        shown = stamp.strftime("%d.%m.%Y" if len(value) == 10 else "%d.%m.%Y %H:%M")
+        return f"{label} · {shown}\n{body}"
+    return body
+
+
 def flush(title_for=lambda e: e.get("tytuł", ""), sender_windows=send_windows, sender_telegram=send_telegram) -> list[dict]:
     """Wysyła oczekujące zdarzenia. Zwraca zdarzenia zakończone w tym wywołaniu (trafiają do historii)."""
     """Postęp jest zapisywany po każdym kanale każdego zdarzenia, a wyjątek nadawcy liczy się
@@ -214,10 +237,10 @@ def flush(title_for=lambda e: e.get("tytuł", ""), sender_windows=send_windows, 
         if not q:
             return finished
         tg = load_telegram()
-        now = datetime.now()
 
         def save() -> None:
             write_json(QUEUE_PATH, q)
+            LOCK_PATH.touch(exist_ok=True)
 
         def attempt(send) -> bool | None:
             try:
@@ -226,22 +249,29 @@ def flush(title_for=lambda e: e.get("tytuł", ""), sender_windows=send_windows, 
                 return False
 
         for e in list(q):
-            title = title_for(e)
             st = e.setdefault("kanały", {ch: "oczekuje" for ch in CHANNELS})
-            if st.get("windows") in ("oczekuje", "błąd"):
-                st["windows"] = "wysłano" if attempt(lambda: sender_windows(title, e["treść"])) else "błąd"
-                save()
-            if st.get("telegram") in ("oczekuje", "błąd"):
-                res = attempt(lambda: sender_telegram(title, e["treść"], tg))
-                st["telegram"] = "wyłączony" if res is None else ("wysłano" if res else "błąd")
-                save()
-            e["próby"] = int(e.get("próby", 0)) + 1
-            created = datetime.fromisoformat(e.get("utworzono", now.isoformat()))
-            pending = [ch for ch in CHANNELS if st.get(ch) == "błąd"]
-            expired = e["próby"] >= MAX_ATTEMPTS or now - created > MAX_AGE
-            if pending and not expired:
-                save()
-                continue
+            now = datetime.now(timezone.utc)
+            try:
+                created = datetime.fromisoformat(e.get("utworzono", now.isoformat())).astimezone(timezone.utc)
+                attempts = int(e.get("próby", 0))
+            except (TypeError, ValueError):
+                created, attempts = now - MAX_AGE, MAX_ATTEMPTS
+            expired = now - created >= MAX_AGE
+            pending = [ch for ch in CHANNELS if st.get(ch) in ("oczekuje", "błąd")]
+            if pending and not expired and attempts < MAX_ATTEMPTS:
+                title, body = title_for(e), _dated_body(e)
+                if "windows" in pending:
+                    st["windows"] = "wysłano" if attempt(lambda: sender_windows(title, body)) else "błąd"
+                    save()
+                if "telegram" in pending:
+                    res = attempt(lambda: sender_telegram(title, body, tg))
+                    st["telegram"] = "wyłączony" if res is None else ("wysłano" if res else "błąd")
+                    save()
+                e["próby"] = attempts + 1
+                pending = [ch for ch in pending if st.get(ch) == "błąd"]
+                if pending and e["próby"] < MAX_ATTEMPTS:
+                    save()
+                    continue
             for ch in pending:
                 st[ch] = "porzucono"
             # najpierw usuwamy z kolejki, potem dopisujemy do historii: w najgorszym razie
@@ -276,8 +306,9 @@ def read_log(limit: int = 200, instrument: str | None = None) -> tuple[list[dict
             continue
         r.setdefault("instrument", "US100")
         for ch in CHANNELS:  # stary format: True / False / None
-            if not isinstance(r.get(ch), str):
-                r[ch] = _OLD_STATUS.get(r.get(ch), "wyłączony")
+            status = r.get(ch)
+            if not isinstance(status, str):
+                r[ch] = _OLD_STATUS[status] if status is None or isinstance(status, bool) else "wyłączony"
         rows.append(r)
     if instrument:
         rows = [r for r in rows if r["instrument"] == instrument]

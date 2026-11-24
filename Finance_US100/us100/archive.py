@@ -17,7 +17,7 @@ OBSERVED = "_pobrano_utc"
 
 
 def path_for(ticker: str, interval: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9^=._-]+", ticker) or interval not in ("D1", "H1"):
+    if not re.fullmatch(r"[A-Za-z0-9^=._-]+", ticker) or interval not in ("D1", "H1", "M5"):
         raise ValueError("Nieobsługiwany symbol lub interwał archiwum.")
     return ARCHIVE_DIR / f"{ticker}_{interval}.parquet"
 
@@ -44,6 +44,7 @@ def save(ticker: str, interval: str, frame: pd.DataFrame, observed_at: pd.Timest
     incoming = frame.loc[ends <= observed_at, COLUMNS].dropna(subset=COLUMNS[:4]).copy()
     if incoming.empty:
         return
+    incoming.attrs.clear()  # czas pobrania zapisujemy w kolumnie, nie w metadanych pandas
     incoming[OBSERVED] = observed_at
     path = path_for(ticker, interval)
     with file_lock(path.with_suffix(".lock"), timeout=2):

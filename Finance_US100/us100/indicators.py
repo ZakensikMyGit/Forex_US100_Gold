@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618)
+CLOSE_QUARTILE = 0.25
 
 
 def ema(s: pd.Series, n: int) -> pd.Series:
@@ -31,6 +32,18 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+
+def close_position(df: pd.DataFrame) -> pd.Series:
+    """Położenie zamknięcia w zakresie świecy, od 0 dla minimum do 1 dla maksimum."""
+    width = df["high"] - df["low"]
+    return (df["close"] - df["low"]) / width.where(width > 0)
+
+
+def relative_volume(volume: pd.Series) -> pd.Series:
+    """Porównaj obrót z medianą poprzednich 20 świec przy min. 12 dodatnich odczytach."""
+    valid = volume.where(volume.gt(0) & np.isfinite(volume))
+    return valid / valid.shift().rolling(20, min_periods=12).median()
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -69,6 +82,8 @@ def detect_divergences(df: pd.DataFrame, k: int = 5, lookback: int = 80) -> list
     a wskaźnik nie potwierdza go względem poprzedniego potwierdzonego ekstremum.
     """
     recent = df.iloc[-lookback:]
+    if recent.empty:
+        return []
     highs, lows = swing_points(recent, k)
     found: list[dict] = []
     last_idx = recent.index[-1]

@@ -6,7 +6,7 @@ import math
 
 import pandas as pd
 
-from .data import bar_closed
+from .data import bar_closed, bar_end
 
 NO_DATA = "brak danych"
 RULE_COLUMNS = ["Spełniona", "Reguła", "Warunek", "Świeca", "Ostatnie zamknięcie", "Dystans [pkt]", "Znaczenie"]
@@ -14,6 +14,8 @@ RULE_COLUMNS = ["Spełniona", "Reguła", "Warunek", "Świeca", "Ostatnie zamkni�
 
 def last_closed(df: pd.DataFrame, interval: str, now: pd.Timestamp | None = None) -> pd.Series | None:
     """Ostatnia zamknięta świeca. None, gdy nie ma żadnej zamkniętej (np. jedna otwarta świeca)."""
+    now = pd.Timestamp.now(tz="UTC") if now is None else now
+    now = min(now, df.attrs.get("pobrano", now))
     for i in range(len(df) - 1, -1, -1):
         if bar_closed(interval, df.index[i], now):
             return df.iloc[i]
@@ -131,7 +133,35 @@ def rejects_level(open_, high, low, close, level, direction: str):
     return (open_ < level) & (high > level) & (close < level)
 
 
-def evaluate_rules(rules: list[dict], frames: dict[str, pd.DataFrame], offset: float) -> pd.DataFrame:
+def candle_patterns(bar: pd.Series, previous: pd.Series | None = None) -> list[str]:
+    """Nazwy formacji na zamkniętej świecy i jej poprzedniczce."""
+    opening, high, low, close = (float(bar[col]) for col in ("open", "high", "low", "close"))
+    span = high - low
+    if span <= 0:
+        return []
+    body = abs(close - opening)
+    lower = min(opening, close) - low
+    upper = high - max(opening, close)
+    found = []
+    if body <= 0.1 * span:
+        found.append("Doji")
+    elif lower >= 2 * body and upper <= 0.15 * span:
+        found.append("Długi dolny cień")
+    elif upper >= 2 * body and lower <= 0.15 * span:
+        found.append("Długi górny cień")
+    if previous is not None:
+        before_open, before_close = float(previous["open"]), float(previous["close"])
+        if close > opening and before_open > before_close and opening <= before_close and close >= before_open:
+            found.append("Objęcie hossy")
+        elif close < opening and before_open < before_close and close <= before_open and opening >= before_close:
+            found.append("Objęcie bessy")
+    return found
+
+
+def evaluate_rules(
+    rules: list[dict], frames: dict[str, pd.DataFrame], offset: float, *, include_closed_at: bool = False,
+    now: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Reguły oceniane wyłącznie na zamkniętych świecach; bez zamkniętej świecy reguła jest pomijana."""
     rows = []
     for rule in rules:
@@ -144,7 +174,7 @@ def evaluate_rules(rules: list[dict], frames: dict[str, pd.DataFrame], offset: f
         df = frames.get(interval)
         if df is None or not level:
             continue
-        bar = last_closed(df, interval)
+        bar = last_closed(df, interval, now)
         if bar is None:
             continue
         close = float(bar["close"]) + offset
@@ -160,4 +190,7 @@ def evaluate_rules(rules: list[dict], frames: dict[str, pd.DataFrame], offset: f
                 "Znaczenie": rule.get("znaczenie", ""),
             }
         )
-    return pd.DataFrame(rows, columns=RULE_COLUMNS)
+        if include_closed_at:
+            rows[-1]["Czas zamknięcia"] = bar_end(interval, bar.name)
+    columns = [*RULE_COLUMNS, "Czas zamknięcia"] if include_closed_at else RULE_COLUMNS
+    return pd.DataFrame(rows, columns=columns)
