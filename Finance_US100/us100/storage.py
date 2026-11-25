@@ -106,6 +106,8 @@ for _key, _d in DEFAULTS.items():
     _d.setdefault("powiadomienia doradcy", True)
     _d.setdefault("symulacja doradcy", True)
     _d.setdefault("symulacja", {})  # parametry automatycznych pozycji wirtualnych
+    _d.setdefault("powiadomienia symulacji rodzin", True)  # wirtualne wejścia i zamknięcia rodzin
+    _d.setdefault("symulacja rodzin", {})  # start symulacji na żywo rodzin sygnałów i wersje ich reguł
     _d.setdefault("plan_ustawienia", {"koszt_pkt": ALL[_key].typical_cost, "min_rr": 1.5, "wolumen": 0.01, "limit_h": 24.0})
 
 CONDITIONS = ("zamknięcie powyżej", "zamknięcie poniżej")

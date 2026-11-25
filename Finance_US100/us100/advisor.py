@@ -547,7 +547,8 @@ def compare_entry_timing(
     return TimingComparison(edges[0], end, compare(h1), compare(short))
 
 
-def against_chance(label: str, stats: History, chance: History | None, z: float = 2.0) -> tuple[str, str]:
+def against_chance(label: str, stats: History, chance: History | None, z: float = 2.0,
+                   unit: str = "pkt") -> tuple[str, str]:
     """Ocena wariantu względem losowych wejść: (rodzaj komunikatu, treść).
 
     Przewaga liczy się tylko wtedy, gdy średni wynik minus z błędów standardowych (domyślnie 2, ok. 95%)
@@ -559,8 +560,8 @@ def against_chance(label: str, stats: History, chance: History | None, z: float 
                         "żeby porównać z losowymi wejściami.")
     bar = max(chance.mean_points, 0.0)
     margin = z * stats.std_points / sqrt(stats.count) if stats.std_points else 0.0
-    numbers = (f"średnio {stats.mean_points:+.2f} pkt (±{margin:.2f}) przy {stats.count} pozycjach, "
-               f"losowe wejścia {chance.mean_points:+.2f} pkt")
+    numbers = (f"średnio {stats.mean_points:+.2f} {unit} (±{margin:.2f}) przy {stats.count} pozycjach, "
+               f"losowe wejścia {chance.mean_points:+.2f} {unit}")
     if stats.mean_points - margin > bar:
         return "success", f"{label}: {numbers}. Przewaga nad przypadkiem i powyżej zera po kosztach."
     if stats.mean_points > bar:

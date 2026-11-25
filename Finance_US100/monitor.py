@@ -18,7 +18,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from us100 import data, delivery, engine, notify, paper, storage
+from us100 import data, delivery, engine, family_alerts, notify, paper, storage
 from us100.instruments import ALL, Instrument, price_text
 
 LOG_FILE = notify.DATA_DIR / "monitor.log"
@@ -65,6 +65,22 @@ def check_instrument(inst: Instrument, snapshot: dict) -> None:
     for e in events:
         log(f"    {e['tytuł']}: {e['treść']}")
     paper.update(inst.key, cfg, frames, observed_at=observed_at)
+    check_families(inst, cfg, frames, observed_at)
+
+
+def check_families(inst: Instrument, cfg: dict, frames: dict, observed_at: pd.Timestamp) -> None:
+    """Symulacja na żywo rodzin sygnałów: wirtualne wejścia, zamknięcia i alerty OTWÓRZ."""
+    state = family_alerts.load_state(inst.key)
+    events, new_state, versions_changed = family_alerts.check(inst.key, cfg, frames, state, observed_at)
+    if new_state is state:
+        return  # brak nowej zamkniętej H1 albo symulacja nie została uruchomiona
+    if versions_changed:
+        storage.save_settings(cfg, inst.key)  # nowa wersja reguł rodziny - jej symulacja liczy się od teraz
+    delivery.enqueue(events)  # jak wyżej: najpierw trwała kolejka, potem stan
+    family_alerts.save_state(new_state, inst.key)
+    log(f"{inst.name}: rodziny sygnałów sprawdzone, nowe zdarzenia: {len(events)}")
+    for e in events:
+        log(f"    {e['tytuł']}: {e['treść']}")
 
 
 def next_close(now: pd.Timestamp) -> pd.Timestamp:
