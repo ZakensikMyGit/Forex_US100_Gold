@@ -86,6 +86,40 @@ class AdvisorReplayTests(unittest.TestCase):
         [trade] = list(advisor._trades(market, 0.0, 1.5, 1.5))
         self.assertEqual((trade.outcome, trade.closed, trade.points), ("limit", times[-1], -3.0))
 
+    def test_random_entries_use_reference_distances_window_and_cost(self):
+        times = pd.date_range("2026-11-02 00:00", periods=60, freq="h", tz=TZ_LOCAL)
+        flat = pd.DataFrame({"open": 100.0, "close": 100.0, "high": 100.5, "low": 99.5}, index=times)
+        market = SimpleNamespace(bars=flat, ends=times + pd.Timedelta(hours=1))
+        proposal = advisor.Proposal(advisor.Level("Sesja D1", "Minimum", "long", 100), times[1], 100, 98, 104, 2.0, ())
+        reference = [advisor.ReplayTrade(proposal, True, times[1], times[3], "TP", 4.0),
+                     advisor.ReplayTrade(proposal, True, times[5], times[9], "otwarta", None)]
+        # SL 2 i TP 4 pkt od wejścia nie mieszczą się w zakresie świec: każde losowe wejście kończy limit
+        stats = advisor.random_entries(market, reference, 0.5, 3, times[10], times[40], draws=7)
+        self.assertEqual((stats.count, stats.targets, stats.stops, stats.timeouts), (7, 0, 0, 7))
+        self.assertEqual(stats.mean_points, -0.5)
+
+        trending = flat.assign(open=range(60), close=[x + 1.0 for x in range(60)],
+                               high=[x + 1.5 for x in range(60)], low=[x - 0.5 for x in range(60)])
+        market = SimpleNamespace(bars=trending, ends=times + pd.Timedelta(hours=1))
+        first = advisor.random_entries(market, reference, 0.0, 24, times[0], times[30], draws=200, seed=3)
+        again = advisor.random_entries(market, reference, 0.0, 24, times[0], times[30], draws=200, seed=3)
+        self.assertEqual(first, again)
+        # w ciągłym trendzie wzrostowym long trafia TP, short trafia SL
+        self.assertEqual(first.targets + first.stops, first.count)
+        self.assertTrue(0.3 < first.targets / first.count < 0.7)
+        self.assertEqual(advisor.random_entries(market, reference, 0.0, 24, times[59], times[59]).count, 0)
+
+    def test_advantage_over_chance_requires_margin_above_random_and_zero(self):
+        chance = advisor.History(8000, 2000, 5500, 500, -0.46, 20.0)
+        # złoto 24.11.2026: +0,43 przy 64 pozycjach i dużym rozrzucie - w granicach przypadku
+        self.assertEqual(advisor.against_chance("Doradca", advisor.History(64, 21, 35, 8, 0.43, 15.0), chance)[0], "info")
+        self.assertEqual(advisor.against_chance("Doradca", advisor.History(400, 160, 200, 40, 3.0, 15.0), chance)[0], "success")
+        self.assertEqual(advisor.against_chance("Doradca", advisor.History(400, 90, 280, 30, -8.6, 15.0), chance)[0], "warning")
+        self.assertEqual(advisor.against_chance("Doradca", advisor.History(12, 6, 6, 0, 5.0, 1.0), chance)[0], "info")
+        # lepszy od przypadku, ale wciąż na minusie po kosztach - to nie jest przewaga
+        self.assertEqual(advisor.against_chance("Doradca", advisor.History(400, 90, 280, 30, -1.0, 1.0),
+                                                advisor.History(8000, 0, 0, 0, -5.0))[0], "warning")
+
 
 class ChartAnnotationsTests(unittest.TestCase):
     def test_entry_at_exact_close_marks_that_candle_and_respects_toggle(self):

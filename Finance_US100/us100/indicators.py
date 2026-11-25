@@ -34,6 +34,20 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
+def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """ADX Wildera - siła trendu bez względu na kierunek (powyżej ok. 20-25: trend)."""
+    up = df["high"].diff()
+    down = -df["low"].diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    smoothed_tr = atr(df, n)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False, min_periods=n).mean() / smoothed_tr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False, min_periods=n).mean() / smoothed_tr
+    total = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / total
+    return dx.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+
 def close_position(df: pd.DataFrame) -> pd.Series:
     """Położenie zamknięcia w zakresie świecy, od 0 dla minimum do 1 dla maksimum."""
     width = df["high"] - df["low"]

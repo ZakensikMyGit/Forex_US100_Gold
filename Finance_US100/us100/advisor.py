@@ -18,6 +18,7 @@ MAX_SIGNAL_AGE = pd.Timedelta(hours=2)
 ALERT_SETTING = "powiadomienia doradcy"
 MIN_VALIDATION_BARS = 250
 ELEVATED_VOLUME = 1.5
+RANDOM_DRAWS = 20  # losowych wejść na każdą pozycję wariantu bazowego
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class History:
     stops: int
     timeouts: int
     mean_points: float | None
+    std_points: float | None = None  # odchylenie standardowe wyniku pojedynczej pozycji
 
     def description(self) -> str:
         if self.count < MIN_HISTORY or self.mean_points is None:
@@ -98,6 +100,7 @@ class Validation:
     test_bars: int
     baseline: History
     advisor: History
+    random: History | None = None  # losowe wejścia z odległościami SL/TP wariantu bazowego
 
 
 @dataclass(frozen=True)
@@ -327,33 +330,77 @@ def _trades(
         if actual_rr is None or actual_rr < min_rr:
             continue
         sign = 1 if direction == "long" else -1
-        stop, target = proposal.stop, proposal.target
         deadline = dates[entry_i] + pd.Timedelta(hours=limit_h)
-        for j in range(entry_i, len(dates)):
-            start_at, end_at = dates[j], ends[j]
-            if start_at >= deadline:
-                label, exit_price, resolved_at = "limit", opens[j], start_at
-                break
-            if (opens[j] - stop) * sign <= 0:
-                label, exit_price, resolved_at = "SL", opens[j], start_at
-                break
-            if (opens[j] - target) * sign >= 0:
-                label, exit_price, resolved_at = "TP", target, start_at
-                break
-            if (lows[j] <= stop if sign > 0 else highs[j] >= stop):
-                label, exit_price, resolved_at = "SL", stop, end_at
-                break
-            if (highs[j] >= target if sign > 0 else lows[j] <= target):
-                label, exit_price, resolved_at = "TP", target, end_at
-                break
-            if end_at >= deadline:
-                label, exit_price, resolved_at = "limit", closes[j], end_at
-                break
-        else:
+        exit_ = _resolve((opens, highs, lows, closes), dates, ends, entry_i, sign, proposal.stop, proposal.target, deadline)
+        if exit_ is None:
             yield ReplayTrade(proposal, not outcome.reason, dates[entry_i], deadline, "otwarta", None)
             continue
+        label, exit_price, resolved_at = exit_
         yield ReplayTrade(proposal, not outcome.reason, dates[entry_i], resolved_at,
                           label, (exit_price - actual_entry) * sign - cost)
+
+
+def _resolve(
+    prices: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], dates: pd.DatetimeIndex, ends: pd.DatetimeIndex,
+    entry_i: int, sign: int, stop: float, target: float, deadline: pd.Timestamp,
+) -> tuple[str, float, pd.Timestamp] | None:
+    """Wyjście z pozycji: luka na otwarciu, potem SL przed TP w tej samej świecy, na końcu limit czasu."""
+    opens, highs, lows, closes = prices
+    for j in range(entry_i, len(dates)):
+        start_at, end_at = dates[j], ends[j]
+        if start_at >= deadline:
+            return "limit", opens[j], start_at
+        if (opens[j] - stop) * sign <= 0:
+            return "SL", opens[j], start_at
+        if (opens[j] - target) * sign >= 0:
+            return "TP", target, start_at
+        if (lows[j] <= stop if sign > 0 else highs[j] >= stop):
+            return "SL", stop, end_at
+        if (highs[j] >= target if sign > 0 else lows[j] <= target):
+            return "TP", target, end_at
+        if end_at >= deadline:
+            return "limit", closes[j], end_at
+    return None
+
+
+def random_entries(
+    market: Market, reference: list[ReplayTrade], cost: float, limit_h: float,
+    start: pd.Timestamp, end: pd.Timestamp, *, draws: int = RANDOM_DRAWS, seed: int = 0,
+) -> History:
+    """Punkt odniesienia: losowa godzina wejścia i losowy kierunek, te same odległości SL i TP.
+
+    Każda pozycja z ``reference`` jest powtarzana ``draws`` razy na losowej świecy z okna
+    [start, end). Reguła, która nie bije tego wyniku, nie ma przewagi nad przypadkiem."""
+    distances = [(abs(t.proposal.entry - t.proposal.stop), abs(t.proposal.target - t.proposal.entry))
+                 for t in reference if t.points is not None]
+    return random_with_distances(market.bars, market.ends, distances, cost, limit_h, start, end, draws=draws, seed=seed)
+
+
+def random_with_distances(
+    bars: pd.DataFrame, ends: pd.DatetimeIndex, distances: list[tuple[float, float]], cost: float, limit_h: float,
+    start: pd.Timestamp, end: pd.Timestamp, *, draws: int = RANDOM_DRAWS, seed: int = 0,
+) -> History:
+    """Losowe wejścia dla par (odległość SL, odległość TP) - wspólne dla Doradcy i rodzin sygnałów."""
+    prices = tuple(bars[col].to_numpy() for col in ("open", "high", "low", "close"))
+    dates = bars.index
+    candidates = np.flatnonzero((dates >= start) & (dates < end))
+    if not len(candidates) or not distances:
+        return History(0, 0, 0, 0, None)
+    rng = np.random.default_rng(seed)
+    hour = pd.Timedelta(hours=limit_h)
+    outcomes: list[tuple[str, float]] = []
+    for risk, reward in distances:
+        for i, sign in zip(rng.choice(candidates, draws), rng.choice((-1, 1), draws)):
+            entry = prices[0][i]
+            exit_ = _resolve(prices, dates, ends, int(i), int(sign), entry - sign * risk, entry + sign * reward, dates[i] + hour)
+            if exit_ is not None:
+                outcomes.append((exit_[0], (exit_[1] - entry) * sign - cost))
+    if not outcomes:
+        return History(0, 0, 0, 0, None)
+    labels = [label for label, _ in outcomes]
+    points = [value for _, value in outcomes]
+    return History(len(outcomes), labels.count("TP"), labels.count("SL"), labels.count("limit"),
+                   float(np.mean(points)), float(np.std(points, ddof=1)) if len(points) > 1 else None)
 
 
 def _summarize(trades: list[ReplayTrade]) -> History:
@@ -361,6 +408,7 @@ def _summarize(trades: list[ReplayTrade]) -> History:
     return History(
         len(finished), sum(t.outcome == "TP" for t in finished), sum(t.outcome == "SL" for t in finished),
         sum(t.outcome == "limit" for t in finished), float(np.mean([t.points for t in finished])) if finished else None,
+        float(np.std([t.points for t in finished], ddof=1)) if len(finished) > 1 else None,
     )
 
 
@@ -446,10 +494,18 @@ def validate_walk_forward(
                 stats, _ = comparable(trade.proposal, training)
                 if not history_hold(stats):
                     confirmed.append(trade)
+        chance = random_entries(market, baseline[baseline_start:], cost, limit_h, cutoff, end, seed=len(windows))
         windows.append(Validation(cutoff, end, start, stop - start, _summarize(baseline[baseline_start:]),
-                                  _summarize(confirmed[confirmed_start:])))
+                                  _summarize(confirmed[confirmed_start:]), chance))
+    total_chance = [w.random for w in windows if w.random is not None and w.random.count]
+    chance_count = sum(h.count for h in total_chance)
+    total_random = History(
+        chance_count, sum(h.targets for h in total_chance), sum(h.stops for h in total_chance),
+        sum(h.timeouts for h in total_chance),
+        sum(h.mean_points * h.count for h in total_chance) / chance_count if chance_count else None,
+    )  # odchylenie nie jest potrzebne: losowa próba jest wielokrotnie większa od ocenianej
     total = Validation(dates[edges[0]], market.ends[-1], edges[0], count - edges[0],
-                       _summarize(baseline), _summarize(confirmed))
+                       _summarize(baseline), _summarize(confirmed), total_random)
     return WalkForward(total, tuple(windows))
 
 
@@ -489,6 +545,30 @@ def compare_entry_timing(
         return _summarize(selected)
 
     return TimingComparison(edges[0], end, compare(h1), compare(short))
+
+
+def against_chance(label: str, stats: History, chance: History | None, z: float = 2.0,
+                   unit: str = "pkt") -> tuple[str, str]:
+    """Ocena wariantu względem losowych wejść: (rodzaj komunikatu, treść).
+
+    Przewaga liczy się tylko wtedy, gdy średni wynik minus z błędów standardowych (domyślnie 2, ok. 95%)
+    przekracza zarówno wynik losowych wejść, jak i zero."""
+    if chance is None or chance.mean_points is None:
+        return "info", f"{label}: brak losowych wejść do porównania."
+    if stats.mean_points is None or stats.count < MIN_HISTORY:
+        return "info", (f"{label}: za mało zakończonych pozycji ({stats.count}/{MIN_HISTORY}), "
+                        "żeby porównać z losowymi wejściami.")
+    bar = max(chance.mean_points, 0.0)
+    margin = z * stats.std_points / sqrt(stats.count) if stats.std_points else 0.0
+    numbers = (f"średnio {stats.mean_points:+.2f} {unit} (±{margin:.2f}) przy {stats.count} pozycjach, "
+               f"losowe wejścia {chance.mean_points:+.2f} {unit}")
+    if stats.mean_points - margin > bar:
+        return "success", f"{label}: {numbers}. Przewaga nad przypadkiem i powyżej zera po kosztach."
+    if stats.mean_points > bar:
+        return "info", (f"{label}: {numbers}. Wynik jest lepszy, ale mieści się w granicach przypadku – "
+                        "potrzeba więcej pozycji, zanim uznasz to za przewagę.")
+    return "warning", (f"{label}: {numbers}. Brak przewagi po kosztach. "
+                       "Nie traktuj tych sygnałów jako podstawy wejścia.")
 
 
 def comparable(proposal: Proposal, history: dict[tuple[str, str, int], History]) -> tuple[History, str]:

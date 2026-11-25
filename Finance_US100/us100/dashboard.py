@@ -8,8 +8,8 @@ from http.client import HTTPException
 import pandas as pd
 import streamlit as st
 
-from . import advisor, archive, backtest, chart_annotations, contracts, data, delivery, engine, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
-from .instruments import GOLD, Instrument
+from . import advisor, archive, backtest, chart_annotations, contracts, data, delivery, engine, families, family_alerts, regime, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
+from .instruments import ALL, GOLD, Instrument
 
 
 @st.cache_data(ttl=300, show_spinner="Pobieram notowania…")
@@ -825,6 +825,10 @@ def render_simulation(inst: Instrument, cfg: dict) -> None:
         )
         min_rr = st.number_input("Min. zysk/ryzyko", min_value=0.1, value=float(settings["min_rr"]), step=0.1, key=f"paper_rr_{k}")
         limit = st.number_input("Limit czasu [godz.]", min_value=1.0, value=float(settings["limit_h"]), step=1.0, key=f"paper_limit_{k}")
+    typical = ALL[k].typical_cost
+    if cost > 5 * typical:
+        st.warning(f"Koszt {cost:g} to ponad 5× typowy koszt w XTB (ok. {typical:g}: spread i poślizg). "
+                   "Tak duży koszt odrzuca prawie każdy sygnał Doradcy. Sprawdź, czy nie wpisano kwoty w PLN lub USD za lot.")
     updated = {**settings, "koszt_pkt": cost, "min_rr": min_rr, "limit_h": limit}
     if updated != settings or enabled != cfg["symulacja doradcy"]:
         cfg["symulacja doradcy"] = enabled
@@ -903,6 +907,185 @@ def render_simulation(inst: Instrument, cfg: dict) -> None:
         )
 
 
+@st.cache_data(ttl=600, max_entries=8, show_spinner="Sprawdzam rodziny sygnałów…")
+def family_evaluations(
+    frames: dict[str, pd.DataFrame], cost: float, min_rr: float, limit: float, as_of: pd.Timestamp, instrument: str,
+    live_starts: dict[str, pd.Timestamp],
+) -> list[families.Evaluation]:
+    return families.evaluate_all(frames, families.Params(cost, min_rr, limit), as_of, instrument, live_starts)
+
+
+def render_family_live(inst: Instrument, cfg: dict, report: list[families.Evaluation], now: pd.Timestamp, unit: str) -> None:
+    """Symulacja na żywo: nowe sygnały rodzin rozliczane na kolejnych świecach, jak w testach."""
+    st.markdown("**Symulacja na żywo**")
+    state = cfg["symulacja rodzin"]
+    if not state.get("start"):
+        st.caption("Symulacja na żywo rozlicza tylko sygnały, które pojawią się od chwili startu, na kolejnych "
+                   "zamkniętych świecach H1 – dokładnie tak jak w testach historycznych. To sprawdzian na danych, "
+                   "których reguły nie mogły „widzieć”. Panel i monitor nie muszą działać bez przerwy: wynik liczy się "
+                   "z zapisanych notowań.")
+        if st.button("Rozpocznij symulację na żywo", icon=":material/play_arrow:", key=f"family_live_start_{inst.key}"):
+            cfg["symulacja rodzin"] = {"start": now.isoformat(), "wersje": {}}
+            storage.save_settings(cfg, inst.key)
+            family_evaluations.clear()
+            st.rerun()
+        return
+    since = pd.Timestamp(state["start"]).tz_convert(data.TZ_LOCAL)
+    notify_sim = st.toggle(
+        "Powiadomienia z symulacji (wirtualne wejścia i zamknięcia)", value=bool(cfg[family_alerts.ALERT_SETTING]),
+        key=f"family_live_notify_{inst.key}",
+        help="Monitor wysyła je po zamknięciu H1 z dopiskiem, że to nie jest sygnał do handlu. "
+             "Alert „OTWÓRZ” dla rodziny, która spełni wszystkie warunki, jest wysyłany zawsze.",
+    )
+    if notify_sim != bool(cfg[family_alerts.ALERT_SETTING]):
+        cfg[family_alerts.ALERT_SETTING] = notify_sim
+        storage.save_settings(cfg, inst.key)
+    st.caption(f"Symulacja trwa od {since:%d.%m.%Y %H:%M}. Wejście na otwarciu H1 po sygnale, koszt jak w testach, "
+               "jedna pozycja naraz w każdej rodzinie. Zmiana reguł rodziny zaczyna jej symulację od nowa.")
+    off = float(cfg["przesunięcie"])
+    rows = []
+    for ev in report:
+        live = ev.live or advisor.History(0, 0, 0, 0, None)
+        rows.append({
+            "Rodzina": ev.name, "Od": f"{ev.live_start.tz_convert(data.TZ_LOCAL):%d.%m.%Y}" if ev.live_start is not None else "–",
+            "Pozycje": live.count, "TP": live.targets, "SL": live.stops, "Limit": live.timeouts,
+            f"Średnio [{unit}]": live.mean_points,
+            f"Łącznie [{unit}]": live.mean_points * live.count if live.mean_points is not None else None,
+            "Otwarta pozycja": ev.live_open.candidate.direction.upper() if ev.live_open else "–",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Wyniki rodzin w symulacji na żywo",
+                 column_config={name: st.column_config.NumberColumn(format="%+.2f")
+                                for name in (f"Średnio [{unit}]", f"Łącznie [{unit}]")})
+    for ev in report:
+        position = ev.live_open
+        if position is None:
+            continue
+        opened = position.opened.tz_convert(data.TZ_LOCAL)
+        st.info(f"{ev.name}: wirtualna pozycja {position.candidate.direction.upper()} od {opened:%d.%m %H:%M} · "
+                f"wejście {position.entry + off:.{inst.decimals}f} · SL {position.stop + off:.{inst.decimals}f} · "
+                f"TP {position.target + off:.{inst.decimals}f} (ceny xStation). {position.candidate.note}.",
+                icon=":material/science:")
+
+    checks = []
+    for ev in report:
+        row = {"Rodzina": ev.name}
+        for label, ok in families.readiness(ev, now):
+            row[label.split(" (")[0]] = "✅" if ok else "⬜"
+        checks.append(row)
+    st.caption("Alerty „OTWÓRZ” dostanie tylko rodzina, która spełni wszystkie warunki:")
+    st.dataframe(pd.DataFrame(checks), hide_index=True, alt="Gotowość rodzin do alertów")
+
+    closed = sorted((trade for ev in report for trade in ev.live_trades), key=lambda t: t.closed, reverse=True)
+    if closed:
+        names = {ev.key: ev.name for ev in report}
+        st.dataframe(pd.DataFrame([{
+            "Rodzina": names.get(t.candidate.family, t.candidate.family), "Kierunek": t.candidate.direction.upper(),
+            "Wejście": f"{t.opened.tz_convert(data.TZ_LOCAL):%d.%m %H:%M}",
+            "Wyjście": f"{t.closed.tz_convert(data.TZ_LOCAL):%d.%m %H:%M}", "Wynik": t.outcome,
+            f"Wynik [{unit}]": t.points,
+        } for t in closed[:30]]), hide_index=True, alt="Ostatnie zamknięte pozycje symulacji na żywo",
+            column_config={f"Wynik [{unit}]": st.column_config.NumberColumn(format="%+.2f")})
+    with st.container(horizontal=True, vertical_alignment="center"):
+        sure = st.checkbox("Potwierdzam: zacznij symulację od nowa", key=f"family_live_reset_ok_{inst.key}")
+        if st.button("Zacznij od nowa", disabled=not sure, key=f"family_live_reset_{inst.key}"):
+            cfg["symulacja rodzin"] = {"start": now.isoformat(), "wersje": {}}
+            storage.save_settings(cfg, inst.key)
+            family_evaluations.clear()
+            st.rerun()
+
+
+def render_families(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame]) -> None:
+    box = st.expander("Rodziny sygnałów – bramka dopuszczenia", key=f"families_{inst.key}", on_change="rerun")
+    if not box.open:
+        return
+    with box:
+        params = cfg["plan_ustawienia"]
+        cost, min_rr, limit = (float(params[name]) for name in ("koszt_pkt", "min_rr", "limit_h"))
+        h1 = frames["H1"]
+        if len(h1) < families.WARMUP_BARS + advisor.MIN_VALIDATION_BARS:
+            st.info("Za mało świec H1, żeby sprawdzić rodziny sygnałów.")
+            return
+        now = pd.Timestamp.now(tz="UTC")
+        starts, changed = families.live_starts(cfg["symulacja rodzin"], inst.key, now)
+        if changed:
+            storage.save_settings(cfg, inst.key)  # nowa wersja reguł rodziny - jej symulacja liczy się od teraz
+        report = family_evaluations(frames, cost, min_rr, limit, data.bar_end("H1", h1.index[-1]).tz_convert("UTC"),
+                                    inst.key, starts)
+        unit = "USD" if inst.key == GOLD.key else "pkt"
+        tested = len(report)
+        z = families.margin_z(tested)
+        st.caption(
+            f"Każda rodzina to osobna hipoteza z regułami ustalonymi z góry, rozliczana tak samo: wejście na otwarciu "
+            f"następnej H1, koszt {cost:g} {unit}, SL przed TP w tej samej świecy, jedna pozycja naraz. "
+            f"Alerty „OTWÓRZ” mogą dostać tylko rodziny ze statusem „przewaga”: co najmniej {families.MIN_TRADES} pozycji, "
+            f"średni wynik minus {z:.2f} błędu standardowego (korekta na {tested} sprawdzane rodziny) "
+            f"powyżej zera i losowych wejść oraz wynik dodatni w {families.MIN_POSITIVE_WINDOWS} z {families.WINDOWS} okien. "
+            f"Ostatnie {families.HOLDOUT_DAYS} dni to dane nietknięte – nie wchodzą do oceny."
+        )
+        st.info(f"Reżim rynku teraz (ostatnia zamknięta H4): {regime.current(frames['H4'], now).text()}. "
+                "Rodzina B handluje tylko w trendzie zgodnym z D1 i przy zwykłej zmienności.",
+                icon=":material/insights:")
+        icons = {"przewaga": "✅ przewaga", "brak przewagi": "⛔ brak przewagi", "za mało danych": "⏳ za mało danych"}
+        rows = []
+        for ev in report:
+            m = families.margin(ev.total, tested)
+            positive = sum(1 for w in ev.windows if w.stats.mean_points is not None and w.stats.mean_points > 0)
+            rows.append({
+                "Rodzina": ev.name, "Status": icons[ev.status], "Pozycje": ev.total.count,
+                "Odsetek TP": f"{ev.total.targets / ev.total.count:.0%}" if ev.total.count else "–",
+                f"Średnio [{unit}]": ev.total.mean_points, f"Margines ± [{unit}]": m,
+                f"Losowe wejścia [{unit}]": ev.random.mean_points,
+                "Okna z plusem": f"{positive}/{len(ev.windows)}",
+            })
+        numbers = {name: st.column_config.NumberColumn(format="%+.2f")
+                   for name in (f"Średnio [{unit}]", f"Losowe wejścia [{unit}]")}
+        numbers[f"Margines ± [{unit}]"] = st.column_config.NumberColumn(format="%.2f")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, column_config=numbers, alt="Ocena rodzin sygnałów")
+        for ev in report:
+            kind, text = ev.verdict
+            {"success": st.success, "info": st.info, "warning": st.warning}[kind](text)
+
+        st.markdown("**Rodziny i ich reguły**")
+        off = float(cfg["przesunięcie"])
+        for ev in report:
+            st.markdown(f"**{ev.name}** – {ev.description}")
+            fresh = ev.latest
+            if fresh is None or now - fresh.at > families.MAX_LIVE_AGE:
+                continue
+            at = fresh.at.tz_convert(data.TZ_LOCAL)
+            prices = (f"{fresh.direction.upper()} · świeca do {at:%d.%m %H:%M} · wejście ok. {fresh.reference + off:.{inst.decimals}f} · "
+                      f"SL {fresh.stop + off:.{inst.decimals}f} · TP {fresh.target + off:.{inst.decimals}f} (ceny xStation). {fresh.note}.")
+            if ev.status == "przewaga":
+                st.success(f"Świeży sygnał: {prices}", icon=":material/notifications_active:")
+            else:
+                st.caption(f"Świeży kandydat tylko do obserwacji (rodzina bez przewagi): {prices}")
+
+        window_rows = []
+        for ev in report:
+            for w in ev.windows:
+                first, last = (t.tz_convert(data.TZ_LOCAL) for t in (w.start, w.end))
+                window_rows.append({
+                    "Rodzina": ev.name, "Okno": f"{first:%d.%m.%Y} – {last:%d.%m.%Y}", "Pozycje": w.stats.count,
+                    f"Średnio [{unit}]": w.stats.mean_points, f"Losowe wejścia [{unit}]": w.random.mean_points,
+                })
+        st.dataframe(pd.DataFrame(window_rows), hide_index=True, alt="Rodziny sygnałów w kolejnych oknach",
+                     column_config={name: st.column_config.NumberColumn(format="%+.2f")
+                                    for name in (f"Średnio [{unit}]", f"Losowe wejścia [{unit}]")})
+
+        render_family_live(inst, cfg, report, now, unit)
+
+        holdout_start = report[0].holdout_start.tz_convert(data.TZ_LOCAL)
+        if st.toggle(f"Pokaż dane nietknięte (od {holdout_start:%d.%m.%Y})", key=f"families_holdout_{inst.key}"):
+            st.warning("Dane nietknięte oglądaj raz, gdy reguły są już ostateczne. Jeśli po ich obejrzeniu zmienisz "
+                       "reguły, ten okres przestaje być niezależnym sprawdzianem.", icon=":material/visibility:")
+            st.dataframe(pd.DataFrame([{
+                "Rodzina": ev.name, "Pozycje": ev.holdout.count,
+                "Odsetek TP": f"{ev.holdout.targets / ev.holdout.count:.0%}" if ev.holdout.count else "–",
+                f"Średnio [{unit}]": ev.holdout.mean_points,
+            } for ev in report]), hide_index=True, alt="Wyniki rodzin na danych nietkniętych",
+                column_config={f"Średnio [{unit}]": st.column_config.NumberColumn(format="%+.2f")})
+
+
 @st.cache_data(ttl=600, max_entries=12, show_spinner="Odtwarzam sygnały doradcy na historii…")
 def advisor_history(
     frames: dict[str, pd.DataFrame], cost: float, min_rr: float, limit: float, as_of: pd.Timestamp,
@@ -952,12 +1135,20 @@ def render_advisor_validation(inst: Instrument, cfg: dict, frames: dict[str, pd.
                 "Odsetek TP": f"{stats.targets / stats.count:.1%}" if stats.count >= advisor.MIN_HISTORY else "Za mało danych",
                 "Średni wynik po kosztach [pkt]": stats.mean_points,
                 "Łączny wynik po kosztach [pkt]": stats.mean_points * stats.count if stats.mean_points is not None else None,
-            } for label, stats in (("Odrzucenie H1", period.baseline), ("Pełny Doradca", period.advisor))]
+            } for label, stats in (("Odrzucenie H1", period.baseline), ("Pełny Doradca", period.advisor),
+                                   (f"Losowe wejścia (×{advisor.RANDOM_DRAWS})", period.random))
+              if stats is not None]
 
         columns = {name: st.column_config.NumberColumn(format="%.2f")
                    for name in ("Średni wynik po kosztach [pkt]", "Łączny wynik po kosztach [pkt]")}
         st.dataframe(pd.DataFrame(comparison_rows(total)), hide_index=True, alt="Łączne wyniki obu wariantów",
                      column_config=columns)
+        st.caption(f"Losowe wejścia: dla każdej pozycji wariantu „Odrzucenie H1” {advisor.RANDOM_DRAWS} razy losujemy "
+                   "godzinę wejścia z tego samego okna i kierunek, z tymi samymi odległościami SL i TP oraz kosztem. "
+                   "Reguła, która nie bije tego wyniku, nie ma przewagi nad przypadkiem.")
+        for label, stats in (("Odrzucenie H1", total.baseline), ("Pełny Doradca", total.advisor)):
+            kind, text = advisor.against_chance(label, stats, total.random, unit="USD" if inst.key == GOLD.key else "pkt")
+            {"success": st.success, "info": st.info, "warning": st.warning}[kind](text)
         rows = []
         for window in report.windows:
             first, last = (t.tz_convert(data.TZ_LOCAL) for t in (window.cutoff, window.end))
@@ -1207,6 +1398,7 @@ def render_archived(inst: Instrument, cfg: dict, frames: dict[str, pd.DataFrame]
                             outcome.proposal if not outcome.reason else None, archived=True)
     simulation, candles = st.tabs(["Symulacja historyczna", "Świece i układy harmoniczne"])
     with simulation:
+        render_families(inst, cfg, frames)
         render_advisor_validation(inst, cfg, frames)
         render_timing_validation(inst, cfg, frames)
     with candles:
@@ -1455,6 +1647,7 @@ def render(inst: Instrument) -> None:
 
     with tab_simulation:
         render_simulation(inst, cfg)
+        render_families(inst, cfg, frames)
         render_advisor_validation(inst, cfg, frames)
         render_timing_validation(inst, cfg, frames)
     with tab_advisor:
