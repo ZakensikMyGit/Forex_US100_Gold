@@ -8,7 +8,7 @@ from http.client import HTTPException
 import pandas as pd
 import streamlit as st
 
-from . import advisor, archive, auto_offset, backtest, chart_annotations, contracts, data, delivery, engine, families, family_alerts, regime, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
+from . import advisor, archive, auto_offset, backtest, chart_annotations, contracts, data, delivery, engine, families, family_alerts, regime, rolls, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
 from .instruments import ALL, GOLD, Instrument
 
 
@@ -20,7 +20,7 @@ def get_frames(ticker: str) -> dict[str, pd.DataFrame]:
 @st.cache_data(ttl=300, show_spinner="Pobieram świece do wykresu…")
 def get_intraday_chart(ticker: str, interval: str) -> pd.DataFrame:
     observed = pd.Timestamp.now(tz="UTC")
-    frame = ind.add_indicators(data.load_intraday(ticker, interval))
+    frame = ind.add_indicators(rolls.adjust(data.load_intraday(ticker, interval), ticker, interval))
     frame.attrs["pobrano"] = observed
     return frame
 
@@ -1612,6 +1612,14 @@ def render(inst: Instrument) -> None:
             measured_day = pd.Timestamp(record["czas"]).tz_convert(data.TZ_LOCAL).date()
             calibrated = max(calibrated, measured_day) if calibrated else measured_day
         roll = contracts.roll_warning(k, inst.ticker, calibrated, pd.Timestamp.now(tz=data.TZ_LOCAL).date())
+        registered = rolls.load(inst.ticker)
+        if registered:
+            last_roll = registered[-1]
+            st.caption(f"Ostatnia zmiana kontraktu: {last_roll.at.tz_convert(data.TZ_LOCAL):%d.%m.%Y %H:%M}, "
+                       f"{last_roll.old} → {last_roll.new}. Wcześniejsza historia przesunięta o {last_roll.gap:+g}, "
+                       "żeby nie było sztucznej luki.")
+            if roll and calibrated and calibrated >= last_roll.at.tz_convert(data.TZ_LOCAL).date():
+                roll = None  # zmiana już wykryta i obsłużona
         if roll:
             st.warning(roll, icon=":material/event_repeat:")
         bars = st.slider("Liczba świec na wykresie", 60, 600, 200, step=20, key=f"bars_{k}")

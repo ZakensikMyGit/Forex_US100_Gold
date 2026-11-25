@@ -138,7 +138,7 @@ def check_events(
         for d in ind.detect_divergences(df):
             key = f"{iv}|{d['typ']}|{d['wskaźnik']}|{d['do']}|{d['status']}"
             new_state["dywergencje"].append(key)
-            if key not in prev_div and not first_run:
+            if key not in prev_div and not quiet:
                 events.append(_divergence_event(d, df, iv, off, instrument))
 
     # 3. RSI wychodzi ze strefy wyprzedania / wykupienia (zamknięte świece H1 i H4)
@@ -149,7 +149,7 @@ def check_events(
         rsi_now = float(bar["rsi"])
         rsi_prev = state.get("rsi", {}).get(iv)
         new_state["rsi"][iv] = rsi_now
-        if rsi_prev is None or first_run:
+        if rsi_prev is None or quiet:
             continue
         if rsi_prev < 30 <= rsi_now:
             title = "RSI odbił z niskiego poziomu"
