@@ -8,7 +8,7 @@ from http.client import HTTPException
 import pandas as pd
 import streamlit as st
 
-from . import advisor, archive, backtest, chart_annotations, contracts, data, delivery, engine, families, family_alerts, regime, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
+from . import advisor, archive, auto_offset, backtest, chart_annotations, contracts, data, delivery, engine, families, family_alerts, regime, gold_spot, harmonics, indicators as ind, journal, notify, paper, plan, price_structures, risk, signals, storage
 from .instruments import ALL, GOLD, Instrument
 
 
@@ -1535,14 +1535,55 @@ def render(inst: Instrument) -> None:
         st.header(f"Ustawienia: {inst.name}")
         archive_only = st.checkbox("Czytaj zapisane świece", key=f"archive_only_{k}",
                                    help="Pokaż wykres i test z lokalnego archiwum Parquet.")
+        auto_on = st.toggle(
+            "Automatyczne przesunięcie", value=bool(cfg.get(auto_offset.SETTING, True)), key=f"auto_off_{k}",
+            help="Monitor co 5 min porównuje ceny z tej samej chwili: złoto – spot XAU z kontraktem GC=F, "
+                 "US100 – indeks ^NDX z kontraktem NQ=F (w sesji kasowej USA). Opóźnienie Yahoo i zmiana "
+                 "kontraktu nie psują wtedy przesunięcia. Wymaga działającego monitora.",
+        )
+        if auto_on != bool(cfg.get(auto_offset.SETTING, True)):
+            cfg[auto_offset.SETTING] = auto_on
+            storage.save_settings(cfg, k)
+        if auto_on:
+            # Monitor zapisuje nowe pomiary w pliku - panel nie może nadpisać ich starą kopią z sesji.
+            fresh = storage.load_settings(k)
+            for name in ("przesunięcie", auto_offset.RECORD, auto_offset.CORRECTION):
+                cfg[name] = fresh[name]
+            st.session_state[f"off_{k}"] = float(cfg["przesunięcie"])
         if f"off_{k}" not in st.session_state:
             st.session_state[f"off_{k}"] = float(cfg["przesunięcie"])
         manual_off = st.number_input(
             f"Przesunięcie względem XTB [{'pkt' if dec <= 1 else 'USD'}]",
             step=step,
             key=f"off_{k}",
-            help=f"Różnica: cena {inst.xtb_symbol} w xStation minus cena {inst.ticker}. Zmiana zapisuje się od razu.",
+            disabled=auto_on,
+            help=f"Różnica: cena {inst.xtb_symbol} w xStation minus cena {inst.ticker}. Zmiana zapisuje się od razu."
+                 + (" Przy automatycznym przesunięciu ustawia je monitor." if auto_on else ""),
         )
+        record = cfg.get(auto_offset.RECORD) or {}
+        if auto_on:
+            if record.get("czas"):
+                measured = pd.Timestamp(record["czas"]).tz_convert(data.TZ_LOCAL)
+                st.caption(f"Pomiar {measured:%d.%m %H:%M}: {record['pomiar']:+g} ({record['źródło']}, "
+                           f"{record['próbki']} par, rozrzut {record['rozrzut']:g}).")
+                if record.get("odrzucono"):
+                    st.warning(f"Ostatni pomiar odrzucony: {record['odrzucono']}.")
+            else:
+                st.caption("Brak pomiaru. Monitor zmierzy przesunięcie po kilku cyklach "
+                           + ("(ok. 15 min)." if k == GOLD.key else "w sesji kasowej USA (15:30–22:00 czasu polskiego)."))
+            correction = st.number_input(
+                "Korekta do pomiaru", value=float(cfg.get(auto_offset.CORRECTION, 0) or 0), step=step,
+                key=f"auto_corr_{k}",
+                help="Stała poprawka, jeśli cena w xStation różni się od ceny referencyjnej (spot lub ^NDX) "
+                     "o kilka punktów, np. przez sposób wyceny CFD.",
+            )
+            if correction != float(cfg.get(auto_offset.CORRECTION, 0) or 0):
+                cfg[auto_offset.CORRECTION] = correction
+                if record.get("czas"):
+                    cfg["przesunięcie"] = round(float(record["pomiar"]) + correction, dec)
+                    record["wartość"] = cfg["przesunięcie"]
+                storage.save_settings(cfg, k)
+                st.rerun()
         with st.form(f"calib_{k}", border=True):
             st.number_input(
                 "Kalibracja: aktualna cena z xStation",
@@ -1552,7 +1593,10 @@ def render(inst: Instrument) -> None:
                 key=f"calib_price_{k}",
                 help="Przesunięcie zostanie wyliczone raz, w chwili kliknięcia, i zapisane razem z czasem obu cen.",
             )
-            st.form_submit_button("Kalibruj", icon=":material/tune:", width="stretch", on_click=_calibrate, disabled=archive_only)
+            st.form_submit_button("Kalibruj", icon=":material/tune:", width="stretch", on_click=_calibrate,
+                                  disabled=archive_only or auto_on)
+            if auto_on:
+                st.caption("Ręczna kalibracja jest wyłączona przy automatycznym przesunięciu.")
         msg = st.session_state.pop(f"calib_msg_{k}", None)
         if msg:
             kind, text = msg
@@ -1564,6 +1608,9 @@ def render(inst: Instrument) -> None:
             calibrated = pd.Timestamp(cal["czas"]).date() if cal.get("czas") else None
         except ValueError:
             calibrated = None
+        if auto_on and record.get("czas"):
+            measured_day = pd.Timestamp(record["czas"]).tz_convert(data.TZ_LOCAL).date()
+            calibrated = max(calibrated, measured_day) if calibrated else measured_day
         roll = contracts.roll_warning(k, inst.ticker, calibrated, pd.Timestamp.now(tz=data.TZ_LOCAL).date())
         if roll:
             st.warning(roll, icon=":material/event_repeat:")

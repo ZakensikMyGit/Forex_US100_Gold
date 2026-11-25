@@ -18,7 +18,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from us100 import data, delivery, engine, family_alerts, notify, paper, storage
+from us100 import archive, auto_offset, data, delivery, engine, family_alerts, notify, paper, storage
 from us100.instruments import ALL, Instrument, price_text
 
 LOG_FILE = notify.DATA_DIR / "monitor.log"
@@ -83,6 +83,20 @@ def check_families(inst: Instrument, cfg: dict, frames: dict, observed_at: pd.Ti
         log(f"    {e['tytuł']}: {e['treść']}")
 
 
+def update_offset(inst: Instrument) -> None:
+    """Automatyczne przesunięcie: pomiar na świecach M5 z tej samej chwili (auto_offset)."""
+    cfg = storage.load_settings(inst.key)
+    if not cfg.get(auto_offset.SETTING, True):
+        return
+    before = dict(cfg.get(auto_offset.RECORD) or {})
+    estimate = auto_offset.measure(inst.key, archive.load(inst.ticker, "M5"))
+    change = auto_offset.apply(cfg, inst.key, estimate)
+    if cfg.get(auto_offset.RECORD) != before:
+        storage.save_settings(cfg, inst.key)
+    if change:
+        log(f"{inst.name}: {change}")
+
+
 def next_close(now: pd.Timestamp) -> pd.Timestamp:
     return now.floor("5min") + pd.Timedelta(minutes=5)
 
@@ -122,6 +136,12 @@ def run_once(expected: pd.Timestamp | None = None, only: dict[str, set[str]] | N
             except Exception as exc:
                 errors[f"{inst.key} M5"] = str(exc)
                 log(f"{inst.name} M5: błąd: {exc}")
+            try:
+                update_offset(inst)
+                errors.pop(f"{inst.key} przesunięcie", None)
+            except Exception as exc:  # brak sieci lub danych - zostaje poprzednie przesunięcie
+                errors[f"{inst.key} przesunięcie"] = str(exc)
+                log(f"{inst.name} przesunięcie: błąd: {exc}")
         if expected is not None and (missing := missing_closes(snapshot, expected, intervals)):
             pending[inst.key] = missing
     try:
