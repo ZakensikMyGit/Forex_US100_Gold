@@ -18,7 +18,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from us100 import archive, auto_offset, data, delivery, engine, family_alerts, notify, paper, storage
+from us100 import archive, auto_offset, data, delivery, engine, family_alerts, notify, paper, rolls, storage
 from us100.instruments import ALL, Instrument, price_text
 
 LOG_FILE = notify.DATA_DIR / "monitor.log"
@@ -44,10 +44,15 @@ STATUS_PATH = notify.DATA_DIR / "monitor_status.json"
 
 def check_instrument(inst: Instrument, snapshot: dict) -> None:
     cfg = storage.load_settings(inst.key)
+    roll_events = check_roll(inst)
     frames = CACHE.frames(inst.ticker)
     snapshot["H1"] = CACHE.hourly_snapshot[inst.ticker]
     observed_at = pd.Timestamp(snapshot["H1"]["pobrano"])
     state = notify.load_state(inst.key)
+    if roll_events and state:
+        # Wyrównana historia zmienia ceny sprzed zmiany kontraktu - to nie ruch rynku.
+        # Jak przy kalibracji: reguły, poziomy, dywergencje i RSI zapisują nowy stan bez alertów.
+        state["przesunięcie"] = float("nan")
     events, new_state = notify.check_events(frames, cfg, state, inst.key, observed_at=observed_at)
     if not state:
         events.insert(0, notify.make_event("Monitor działa",
@@ -55,6 +60,7 @@ def check_instrument(inst: Instrument, snapshot: dict) -> None:
                                            "Kolejna wiadomość pojawi się po wykryciu nowego zdarzenia.", inst.key))
     # Kolejność ma znaczenie: najpierw zdarzenia trafiają do trwałej kolejki, dopiero potem
     # zapisujemy nowy stan. Awaria wysyłki nie zgubi więc alertu - zostanie ponowiony.
+    events = roll_events + events
     delivery.enqueue(events)
     notify.save_state(new_state, inst.key)
     log(f"{inst.name}: cena {new_state['cena']:.1f}, nowe zdarzenia: {len(events)}")
@@ -81,6 +87,29 @@ def check_families(inst: Instrument, cfg: dict, frames: dict, observed_at: pd.Ti
     log(f"{inst.name}: rodziny sygnałów sprawdzone, nowe zdarzenia: {len(events)}")
     for e in events:
         log(f"    {e['tytuł']}: {e['treść']}")
+
+
+def check_roll(inst: Instrument) -> list[dict]:
+    """Zmiana kontraktu w serii ciągłej Yahoo: zapis w rejestrze i komunikat dla użytkownika."""
+    try:
+        roll = rolls.check(inst.key)
+    except Exception as exc:  # brak danych kontraktów - spróbujemy w kolejnym cyklu
+        log(f"{inst.name}: sprawdzenie zmiany kontraktu nie powiodło się: {exc}")
+        return []
+    if roll is None:
+        return []
+    at = roll.at.tz_convert(data.TZ_LOCAL)
+    log(f"{inst.name}: zmiana kontraktu {roll.old} -> {roll.new} od {at:%d.%m %H:%M}, skok {roll.gap:+g}")
+    event = notify.make_event(
+        "Zmiana kontraktu – historia wyrównana",
+        f"{inst.ticker} przeszedł z {roll.old} na {roll.new} od świecy {at:%d.%m %H:%M}. Różnica cen kontraktów "
+        f"{roll.gap:+g} wyglądała na wykresie jak nagły ruch. Wcześniejsze świece przesunięto o tę wartość, "
+        "a symulacja i wskaźniki zostały przeliczone. Alerty z ostatniej godziny przed tą wiadomością mogły "
+        "wynikać z luki – sprawdź je na wykresie.",
+        inst.key, at=roll.at, time_label="Zmiana kontraktu",
+    )
+    event["id"] = f"zmiana-kontraktu-{inst.key}-{roll.new}"
+    return [event]
 
 
 def update_offset(inst: Instrument) -> None:

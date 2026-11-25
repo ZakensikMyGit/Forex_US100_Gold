@@ -7,13 +7,19 @@ import time
 
 import pandas as pd
 
-from . import archive, data, indicators as ind
+from . import archive, data, indicators as ind, rolls
 from .signals import last_closed
 
 LOG = logging.getLogger(__name__)
 
 
-def build_frames(daily: pd.DataFrame, hourly: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def build_frames(daily: pd.DataFrame, hourly: pd.DataFrame, ticker: str | None = None) -> dict[str, pd.DataFrame]:
+    if ticker is not None:
+        # Ciągła seria Yahoo w skali najnowszego kontraktu - bez sztucznych luk przy zmianie kontraktu.
+        registered = rolls.load(ticker)
+        if registered:
+            hourly = rolls.adjust(hourly, ticker, "H1", registered)
+            daily = rolls.adjust_daily(daily, ticker, hourly, registered)
     h4 = data.resample_h4(hourly)
     observed = hourly.attrs.get("pobrano")
     if observed is not None and not h4.empty:
@@ -32,11 +38,11 @@ def build_frames(daily: pd.DataFrame, hourly: pd.DataFrame) -> dict[str, pd.Data
 def load_frames(ticker: str = data.TICKER_NQ) -> dict[str, pd.DataFrame]:
     """Pełne pobranie historii (panel - z buforem Streamlit)."""
     daily, hourly = _fetch_history(ticker)
-    return build_frames(daily, hourly)
+    return build_frames(daily, hourly, ticker)
 
 
 def load_archived_frames(ticker: str) -> dict[str, pd.DataFrame]:
-    return build_frames(archive.load(ticker, "D1"), archive.load(ticker, "H1"))
+    return build_frames(archive.load(ticker, "D1"), archive.load(ticker, "H1"), ticker)
 
 
 def _latest_bar(frame: pd.DataFrame, interval: str, now: pd.Timestamp) -> dict:
@@ -66,11 +72,11 @@ def _with_latest(frame: pd.DataFrame, interval: str, info: dict) -> pd.DataFrame
 
 def load_monitor_frames(ticker: str, snapshot: dict) -> dict[str, pd.DataFrame]:
     hourly = _with_latest(archive.load(ticker, "H1"), "H1", snapshot.get("H1", {}))
-    return build_frames(archive.load(ticker, "D1"), hourly)
+    return build_frames(archive.load(ticker, "D1"), hourly, ticker)
 
 
 def load_short_chart(ticker: str, interval: str, snapshot: dict | None = None) -> pd.DataFrame:
-    bars = _with_latest(archive.load(ticker, "M5"), "M5", (snapshot or {}).get("M5", {}))
+    bars = rolls.adjust(_with_latest(archive.load(ticker, "M5"), "M5", (snapshot or {}).get("M5", {})), ticker, "M5")
     if interval == "M15":
         grouped = bars.resample("15min")
         aggregated = grouped.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
@@ -170,7 +176,7 @@ class FrameCache:
         self.hourly_snapshot[ticker] = _latest_bar(hourly, "H1", observed_at)
         if not daily.empty and daily.attrs["pobrano"] < data.bar_end("D1", daily.index[-1]) <= observed_at:
             daily = _closed_as_observed(daily, "D1")
-        return build_frames(daily, hourly)
+        return build_frames(daily, hourly, ticker)
 
     def short_snapshot(self, ticker: str) -> dict:
         period = "5d" if archive.path_for(ticker, "M5").exists() else "1mo"

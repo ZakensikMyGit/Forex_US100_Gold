@@ -89,7 +89,8 @@ def check(key: str, cfg: dict, frames: dict[str, pd.DataFrame], state: dict, obs
 
     for ev in report:
         for trade in ev.live_trades:
-            trade_id = f"{ev.key}|{trade.opened.isoformat()}"
+            # wynik w identyfikatorze: po wyrównaniu historii (zmiana kontraktu) pozycja może zamknąć się inaczej
+            trade_id = f"{ev.key}|{trade.opened.isoformat()}|{trade.outcome}|{trade.closed.isoformat()}"
             if trade_id in seen_closed:
                 continue
             seen_closed.add(trade_id)
